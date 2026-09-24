@@ -120,9 +120,25 @@ impl L2BlockImporter {
     }
 
     /// Removes and returns block `number`, dropping every queued block below it.
+    ///
+    /// Pops the stale entries one at a time rather than splitting the map. `split_off` returns
+    /// everything at or above the key, and the queue holds the blocks peers have delivered but
+    /// this node has not imported yet — so almost every entry is above `number`, and assigning
+    /// the result back rebuilt nearly the whole map on every single import. The cost then scaled
+    /// with queue depth, and the depth grows whenever peers stream faster than imports drain:
+    /// import rate fell from ~45 blocks/s to under 5 over a few thousand blocks, and a restart
+    /// (which empties the queue) restored it every time.
+    ///
+    /// Stale entries are rare — normally none — so this is a comparison in the common case
+    /// instead of a rebuild.
     fn take(&self, number: u64) -> Option<QueuedBlock> {
         let mut queue = self.queue();
-        *queue = queue.split_off(&number);
+        while queue
+            .first_key_value()
+            .is_some_and(|(&first, _)| first < number)
+        {
+            queue.pop_first();
+        }
         queue.remove(&number)
     }
 
