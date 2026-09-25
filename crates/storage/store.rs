@@ -16,7 +16,7 @@ use crate::{
     backend::in_memory::InMemoryBackend,
     block_data_buffer::BlockDataBuffer,
     error::StoreError,
-    journal::{FlatDiff, JournalEntry},
+    journal::{FlatDiff, JOURNAL_PRUNE_INTERVAL, JournalEntry},
     layering::{Overlay, TrieLayerCache, TrieWrapper},
     rlp::{BlockBodyRLP, BlockHeaderRLP, BlockRLP},
     trie::{BackendTrieDB, BackendTrieDBLocked, classify_trie_key},
@@ -1388,7 +1388,20 @@ impl Store {
                 // with a spurious `MissingEntry`. The finalized-number update above
                 // still lands; pruning catches up on the next advance after the
                 // pass ends because `delete_range` is cumulative from zero.
+                //
+                // That same cumulativeness is why the sweep is batched to once per
+                // `JOURNAL_PRUNE_INTERVAL` blocks instead of running on every
+                // advance: each call leaves a range tombstone anchored at key 0, so
+                // per-block pruning builds a fully overlapping set that RocksDB
+                // re-fragments on every read crossing it. See the pruning-model
+                // section of `crate::journal` for the measured effect on an L2
+                // follower, which finalizes every block it imports.
+                //
+                // Comparing the interval buckets rather than the raw numbers keeps
+                // the original guard's behaviour for a no-op or backwards FCU: both
+                // leave the bucket unchanged or lower, so neither prunes.
                 if finalized > prev_finalized
+                    && finalized / JOURNAL_PRUNE_INTERVAL > prev_finalized / JOURNAL_PRUNE_INTERVAL
                     && !journal_pruning_paused.load(std::sync::atomic::Ordering::Acquire)
                 {
                     let start = 0u64.to_be_bytes();
@@ -5853,26 +5866,84 @@ mod state_history_tests {
         )
         .unwrap();
 
-        seed_journal_entries(&backend, &(1..=10).collect::<Vec<_>>());
-        for n in 1..=10 {
+        // Straddle an interval boundary: pruning only runs on a sweep, and a sweep
+        // only happens when finality crosses a multiple of JOURNAL_PRUNE_INTERVAL.
+        let boundary = JOURNAL_PRUNE_INTERVAL;
+        let seeded: Vec<_> = ((boundary - 4)..=(boundary + 5)).collect();
+        seed_journal_entries(&backend, &seeded);
+        for n in seeded.iter().copied() {
             assert!(journal_entry_exists(&backend, n), "seed entry {n} present");
         }
 
         store
-            .forkchoice_update_inner(vec![], 100, H256::zero(), None, Some(5))
+            .forkchoice_update_inner(vec![], 100, H256::zero(), None, Some(boundary))
             .await
             .unwrap();
 
-        for n in 1..=5 {
+        for n in (boundary - 4)..=boundary {
             assert!(
                 !journal_entry_exists(&backend, n),
                 "entry {n} should have been pruned (<= finalized)"
             );
         }
-        for n in 6..=10 {
+        for n in (boundary + 1)..=(boundary + 5) {
             assert!(
                 journal_entry_exists(&backend, n),
                 "entry {n} should remain (> finalized)"
+            );
+        }
+    }
+
+    /// Finality advancing *within* one interval SHALL defer the sweep, and the next
+    /// interval crossing SHALL remove everything the deferred sweeps would have.
+    #[tokio::test]
+    async fn finality_advance_within_interval_defers_pruning() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::open().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::from_backend(
+            backend.clone(),
+            dir.path().to_path_buf(),
+            1,
+            DEFAULT_PERSIST_CHANNEL_CAPACITY,
+        )
+        .unwrap();
+
+        seed_journal_entries(&backend, &(1..=5).collect::<Vec<_>>());
+
+        // Advance to the last block before the first boundary: same bucket as 0, so
+        // no range tombstone is written even though finality moved a long way.
+        store
+            .forkchoice_update_inner(
+                vec![],
+                100,
+                H256::zero(),
+                None,
+                Some(JOURNAL_PRUNE_INTERVAL - 1),
+            )
+            .await
+            .unwrap();
+        for n in 1..=5 {
+            assert!(
+                journal_entry_exists(&backend, n),
+                "entry {n} must survive an advance that stays inside one interval"
+            );
+        }
+
+        // One more block crosses the boundary and sweeps cumulatively from zero.
+        store
+            .forkchoice_update_inner(
+                vec![],
+                100,
+                H256::zero(),
+                None,
+                Some(JOURNAL_PRUNE_INTERVAL),
+            )
+            .await
+            .unwrap();
+        for n in 1..=5 {
+            assert!(
+                !journal_entry_exists(&backend, n),
+                "entry {n} must be pruned once finality crosses the interval"
             );
         }
     }
@@ -6516,12 +6587,16 @@ mod state_history_tests {
         )
         .unwrap();
 
-        seed_journal_entries(&backend, &(1..=5).collect::<Vec<_>>());
+        let first = JOURNAL_PRUNE_INTERVAL;
+        let second = JOURNAL_PRUNE_INTERVAL * 2;
 
-        // Paused: finality advance to 3 must not prune anything.
+        seed_journal_entries(&backend, &(1..=5).collect::<Vec<_>>());
+        seed_journal_entries(&backend, &((second + 1)..=(second + 3)).collect::<Vec<_>>());
+
+        // Paused: an advance that crosses a boundary must still not prune anything.
         store.set_journal_pruning_paused(true);
         store
-            .forkchoice_update_inner(vec![], 100, H256::zero(), None, Some(3))
+            .forkchoice_update_inner(vec![], 100, H256::zero(), None, Some(first))
             .await
             .unwrap();
         for n in 1..=5 {
@@ -6531,19 +6606,25 @@ mod state_history_tests {
             );
         }
 
-        // Released: the next advance prunes cumulatively from zero.
+        // Released: the next sweep prunes cumulatively from zero, so the entries the
+        // paused sweep skipped go with it.
         store.set_journal_pruning_paused(false);
         store
-            .forkchoice_update_inner(vec![], 100, H256::zero(), None, Some(4))
+            .forkchoice_update_inner(vec![], 100, H256::zero(), None, Some(second))
             .await
             .unwrap();
-        for n in 1..=4 {
+        for n in 1..=5 {
             assert!(
                 !journal_entry_exists(&backend, n),
                 "entry {n} must be pruned once the pause is released"
             );
         }
-        assert!(journal_entry_exists(&backend, 5));
+        for n in (second + 1)..=(second + 3) {
+            assert!(
+                journal_entry_exists(&backend, n),
+                "entry {n} is above the finality boundary and must remain"
+            );
+        }
     }
 }
 

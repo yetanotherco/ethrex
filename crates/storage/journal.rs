@@ -15,12 +15,25 @@
 //!
 //! ## Pruning model
 //!
-//! When a `forkchoice_update` advances the finalized block, `forkchoice_update_inner`
-//! calls `delete_range(STATE_HISTORY, 0, finalized_number + 1)`, removing all journal
+//! When a `forkchoice_update` advances the finalized block past a multiple of
+//! [`JOURNAL_PRUNE_INTERVAL`], `forkchoice_update_inner` calls
+//! `delete_range(STATE_HISTORY, 0, finalized_number + 1)`, removing all journal
 //! entries at or below the new finality boundary. The surviving entries cover
-//! `[finalized_number+1, cache_edge_D]`, which is exactly the window a future
-//! deep reorg could need. After pruning, `Store::lowest_state_history_block_number`
-//! reflects the new floor.
+//! `[finalized_number+1, cache_edge_D]` plus up to `JOURNAL_PRUNE_INTERVAL`
+//! already-finalized entries not yet swept, which is a superset of the window a
+//! future deep reorg could need. After pruning,
+//! `Store::lowest_state_history_block_number` reflects the new floor.
+//!
+//! Pruning is batched rather than run on every advance because each call writes a
+//! RocksDB range tombstone anchored at key 0, so consecutive calls overlap
+//! completely. RocksDB re-fragments and re-sorts the whole overlapping set on
+//! every read that crosses it, making read cost grow with the number of
+//! tombstones. On an L2 follower — which finalizes every block it imports, see
+//! `L2BlockImporter::import_ready_blocks` — that is one tombstone per block, and
+//! import throughput decayed from ~80 blocks/s to under 4 over a few thousand
+//! blocks, recovering on every restart. A 30-second profile of a follower in that
+//! state put 86% of process CPU in `FragmentedRangeTombstoneList::FragmentTombstones`
+//! and the sorts beneath it.
 //!
 //! ## Batch mode (full sync)
 //!
@@ -63,6 +76,25 @@ use ethrex_common::H256;
 /// across the upgrade should introduce per-version `decode_vN` arms here
 /// rather than re-encoding existing entries.
 pub const JOURNAL_VERSION: u8 = 1;
+
+/// How far finality must advance before the journal is swept again.
+///
+/// Pruning is cumulative from zero — `delete_range(STATE_HISTORY, 0, finalized + 1)`
+/// — so a skipped sweep is never lost work: the next one removes everything the
+/// skipped ones would have. Batching therefore only changes how many finalized
+/// entries linger, never which entries survive.
+///
+/// The cost of not batching is on the read side. See the pruning-model section
+/// above: one range tombstone per finalized block, all anchored at key 0, all
+/// mutually overlapping.
+///
+/// 1024 matches the full-sync layer-commit interval, and bounds the lingering
+/// entries at 1024 — small against a journal that already spans the reorg window,
+/// and it leaves `lowest_state_history_block_number` lower than strictly
+/// necessary, which only widens `journal_reach` in
+/// `ethrex_blockchain::fork_choice`. A wider reach is permissive, not wrong: the
+/// entries backing it really are present.
+pub const JOURNAL_PRUNE_INTERVAL: u64 = 1024;
 
 /// A single reverse-diff entry: `(on_disk_key, previous_value_or_none)`.
 ///
