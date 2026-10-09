@@ -86,6 +86,11 @@ interface IOnChainProposer {
         bytes32 newVerificationKey
     );
 
+    /// @notice The SP1 verifier contract has been changed.
+    /// @param oldVerifier The previous SP1 verifier address.
+    /// @param newVerifier The new SP1 verifier address.
+    event SP1VerifierUpdated(address oldVerifier, address newVerifier);
+
     /// @notice Upgrades the SP1 verification key that represents the sequencer's code.
     /// @param new_vk new verification key for SP1 verifier
     /// @param commit_hash git commit hash that produced the new verification key
