@@ -205,6 +205,43 @@ contract OnChainProposer is
         OwnableUpgradeable.__Ownable_init(timelock_owner);
     }
 
+    /// @dev Reinitializer for upgrading from v6 to v9.
+    /// @dev Migrates verification keys from deprecated storage variables
+    /// @dev to the new verificationKeys mapping, and initiates ownership
+    /// @dev transfer to the Timelock contract.
+    /// @dev After this, the Timelock must call acceptOwnership() to complete the transfer.
+    /// @param commitHash the commit hash to associate with the verification keys.
+    /// @param sp1Vk the SP1 verification key (pass bytes32(0) if SP1 not required).
+    /// @param risc0Vk the RISC0 verification key (pass bytes32(0) if RISC0 not required).
+    /// @param timelockOwner the Timelock contract address to transfer ownership to.
+    function reinitializeV9(
+        bytes32 commitHash,
+        bytes32 sp1Vk,
+        bytes32 risc0Vk,
+        address timelockOwner
+    ) public reinitializer(2) {
+        require(
+            commitHash != bytes32(0),
+            "OnChainProposer: commit hash is zero"
+        );
+        require(
+            !REQUIRE_SP1_PROOF || sp1Vk != bytes32(0),
+            "OnChainProposer: missing SP1 verification key"
+        );
+        require(
+            !REQUIRE_RISC0_PROOF || risc0Vk != bytes32(0),
+            "OnChainProposer: missing RISC0 verification key"
+        );
+        verificationKeys[commitHash][SP1_VERIFIER_ID] = sp1Vk;
+        verificationKeys[commitHash][RISC0_VERIFIER_ID] = risc0Vk;
+
+        require(
+            timelockOwner != address(0),
+            "OnChainProposer: timelock owner is the zero address"
+        );
+        transferOwnership(timelockOwner);
+    }
+
     /// @inheritdoc IOnChainProposer
     function upgradeSP1VerificationKey(
         bytes32 commit_hash,

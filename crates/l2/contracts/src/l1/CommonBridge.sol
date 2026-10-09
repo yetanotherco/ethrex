@@ -164,6 +164,31 @@ contract CommonBridge is
         CHAIN_ID = chainId;
     }
 
+    /// @dev Reinitializer for upgrading from v6 to v9.
+    /// @dev Sets new storage variables introduced in v9, clears deprecated state,
+    /// @dev and initiates ownership transfer to the Timelock contract.
+    /// @dev After this, the Timelock must call acceptOwnership() to complete the transfer.
+    /// @param _sharedBridgeRouter the address of the shared bridge router.
+    /// @param chainId the chain ID for this bridge.
+    /// @param timelockOwner the Timelock contract address to transfer ownership to.
+    function reinitializeV9(
+        address _sharedBridgeRouter,
+        uint256 chainId,
+        address timelockOwner
+    ) public reinitializer(2) {
+        SHARED_BRIDGE_ROUTER = _sharedBridgeRouter;
+        CHAIN_ID = chainId;
+
+        // Clear deprecated v6 state to prevent stale reads.
+        NATIVE_TOKEN_L1 = address(0);
+
+        require(
+            timelockOwner != address(0),
+            "CommonBridge: timelock owner is the zero address"
+        );
+        transferOwnership(timelockOwner);
+    }
+
     /// @inheritdoc ICommonBridge
     function getPendingTransactionHashes()
         public
