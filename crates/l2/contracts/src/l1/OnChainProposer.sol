@@ -206,7 +206,7 @@ contract OnChainProposer is
     /// pointed at the gateway can no longer verify SP1 v5 proofs. This repoints it, at the
     /// v5.0.0 verifier itself for instance.
     /// @param sp1verifier the address of the sp1 groth16 verifier.
-    function initializeV3(
+    function initializeSp1Patch(
         address sp1verifier
     ) public reinitializer(3) onlyOwner {
         // Covers the zero address, and an address from the wrong chain.
