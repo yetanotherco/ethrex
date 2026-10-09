@@ -242,6 +242,25 @@ contract OnChainProposer is
         transferOwnership(timelockOwner);
     }
 
+    /// @notice Points SP1 verification at a new verifier contract.
+    /// @dev Called through `upgradeToAndCall` when upgrading to this implementation.
+    /// @dev Version 3 follows reinitializeV9's 2.
+    /// @dev Succinct froze the v5.0.0 Groth16 route on its SP1VerifierGateway, so a deployment
+    /// pointed at the gateway can no longer verify SP1 v5 proofs. This repoints it, at the
+    /// v5.0.0 verifier itself for instance.
+    /// @param sp1verifier the address of the sp1 groth16 verifier.
+    function initializeSp1Patch(
+        address sp1verifier
+    ) public reinitializer(3) onlyOwner {
+        // Covers the zero address, and an address from the wrong chain.
+        require(
+            sp1verifier.code.length > 0,
+            "OnChainProposer: SP1 verifier has no code"
+        );
+        emit SP1VerifierUpdated(SP1_VERIFIER_ADDRESS, sp1verifier);
+        SP1_VERIFIER_ADDRESS = sp1verifier;
+    }
+
     /// @inheritdoc IOnChainProposer
     function upgradeSP1VerificationKey(
         bytes32 commit_hash,
