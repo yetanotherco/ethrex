@@ -18,11 +18,112 @@ use ethrex_rlp::{
 use super::GenesisAccount;
 use crate::constants::{EMPTY_KECCAK_HASH, EMPTY_TRIE_HASH};
 
-/// Shared empty jump-target table. `Code::default()` and any bytecode without a
+/// Shared empty jump-target bitmap. `Code::default()` and any bytecode without a
 /// `JUMPDEST` clone this (a refcount bump) instead of allocating a fresh empty
 /// `Arc` header each time. This matters because the per-tx `Code::default()`
 /// placeholder and every EOA / empty-code load would otherwise each allocate.
-static EMPTY_JUMP_TARGETS: LazyLock<Arc<[u32]>> = LazyLock::new(|| Arc::from(Vec::new()));
+static EMPTY_JUMP_TARGETS: LazyLock<Arc<[u64]>> = LazyLock::new(|| Arc::from(Vec::new()));
+
+/// The valid jump destinations of a bytecode, as a bitmap: bit `i` is set iff
+/// byte `i` is a `JUMPDEST` (0x5B) that the analysis reaches as an opcode, i.e.
+/// one that is not part of a `PUSH1`..`PUSH32` immediate.
+///
+/// The analysis is the one this type replaces, which collected the same offsets
+/// into a sorted list: same scan, same skip over push data, and a push whose
+/// immediate runs past the end of the code simply ends the scan. A bitmap makes
+/// the check a `JUMP`/`JUMPI` does an O(1) bit test instead of a binary search.
+///
+/// Canonical form, so that `PartialEq`/`Hash` agree with equal analyses: empty
+/// (the shared empty table) when the code has no valid `JUMPDEST`, otherwise one
+/// word per 64 bytes of code, rounded up.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct JumpTargets(Arc<[u64]>);
+
+impl Default for JumpTargets {
+    fn default() -> Self {
+        Self(EMPTY_JUMP_TARGETS.clone())
+    }
+}
+
+impl JumpTargets {
+    /// The analysis of `code`, the logical (unpadded) bytecode.
+    pub fn compute(code: &[u8]) -> Self {
+        debug_assert!(code.len() <= u32::MAX as usize);
+        let mut bits = vec![0u64; code.len().div_ceil(64)];
+        let mut any = false;
+        let mut i = 0;
+        while i < code.len() {
+            // TODO: we don't use the constants from the vm module to avoid a circular dependency
+            let op = code[i];
+            if op == 0x5B {
+                // OP_JUMPDEST
+                if let Some(word) = bits.get_mut(i >> 6) {
+                    *word |= 1u64 << (i & 63);
+                }
+                any = true;
+            } else if (op as i8) > 0x5F {
+                // OP_PUSH1..32 (0x60..=0x7F; 0x80..=0xFF are negative as `i8`):
+                // skip the immediate, `op - 0x5F` bytes (OP_PUSH0 has none).
+                i += (op - 0x5F) as usize;
+            }
+            i += 1;
+        }
+        if any {
+            Self(Arc::from(bits))
+        } else {
+            Self::default()
+        }
+    }
+
+    /// The bitmap of a list of valid destinations (the persisted and serialized
+    /// form) for a code of `code_len` bytes. An offset at or past `code_len` can
+    /// never be a valid destination (the bytes there are the dispatch padding,
+    /// all STOP), so it is dropped.
+    pub fn from_offsets(offsets: &[u32], code_len: usize) -> Self {
+        let mut bits = vec![0u64; code_len.div_ceil(64)];
+        let mut any = false;
+        for &offset in offsets {
+            let i = offset as usize;
+            if i < code_len {
+                bits[i >> 6] |= 1u64 << (i & 63);
+                any = true;
+            }
+        }
+        if any {
+            Self(Arc::from(bits))
+        } else {
+            Self::default()
+        }
+    }
+
+    /// The valid destinations in increasing order: the list form this bitmap
+    /// replaces, for persistence and serialization.
+    pub fn to_offsets(&self) -> Vec<u32> {
+        let mut offsets = Vec::new();
+        for (w, &word) in self.0.iter().enumerate() {
+            let mut rest = word;
+            while rest != 0 {
+                let b = rest.trailing_zeros() as usize;
+                offsets.push((w * 64 + b) as u32);
+                rest &= rest - 1;
+            }
+        }
+        offsets
+    }
+
+    /// Whether `pc` is a valid jump destination. Any `pc` past the code is not.
+    #[inline]
+    pub fn contains(&self, pc: usize) -> bool {
+        self.0
+            .get(pc >> 6)
+            .is_some_and(|word| (word >> (pc & 63)) & 1 == 1)
+    }
+
+    /// Heap bytes the bitmap holds.
+    pub fn heap_size(&self) -> usize {
+        self.0.len() * size_of::<u64>()
+    }
+}
 
 /// Trailing STOP bytes appended to every bytecode so the dispatch loop can read
 /// the next opcode without a bounds check. 33 is the widest single-opcode advance
@@ -42,13 +143,12 @@ pub struct Code {
     bytecode: Bytes,
     /// The real bytecode length, needed for some opcodes, `bytecode` is padded with 33 STOPs to avoid checked adds on hot loop.
     bytecode_len: usize,
-    // `Arc<[u32]>` so cloning `Code` (hot: every message-call resolves and clones
-    // the callee's code) is a refcount bump instead of deep-copying the table.
-    // Serializes via serde's `rc` feature (enabled workspace-wide).
-    // The valid addresses are 32-bit because, despite EIP-3860 restricting initcode size,
-    // this does not apply to previous forks. This is tested in the EEST tests, which would
-    // panic in debug mode.
-    pub jump_targets: Arc<[u32]>,
+    // A bitmap behind an `Arc` so cloning `Code` (hot: every message-call
+    // resolves and clones the callee's code) is a refcount bump instead of
+    // deep-copying the table. It serializes and persists as the list of valid
+    // offsets it replaces (32-bit because, despite EIP-3860 restricting initcode
+    // size, this does not apply to previous forks).
+    pub jump_targets: JumpTargets,
 }
 
 impl Code {
@@ -59,14 +159,14 @@ impl Code {
     // `code` is the logical, unpadded bytecode; `BYTECODE_PADDING` STOP bytes are
     // appended internally by `from_parts_unchecked`.
     pub fn from_bytecode_unchecked(code: Bytes, hash: H256) -> Self {
-        let jump_targets = Self::compute_jump_targets(&code);
+        let jump_targets = JumpTargets::compute(&code);
         Self::from_parts_unchecked(hash, &code, jump_targets)
     }
 
     /// `code` is the logical, unpadded bytecode; `BYTECODE_PADDING` STOP bytes are
     /// appended internally by `from_parts_unchecked`.
     pub fn from_bytecode(code: Bytes, crypto: &dyn Crypto) -> Self {
-        let jump_targets = Self::compute_jump_targets(&code);
+        let jump_targets = JumpTargets::compute(&code);
         let hash = H256(crypto.keccak256(code.as_ref()));
         Self::from_parts_unchecked(hash, &code, jump_targets)
     }
@@ -78,7 +178,7 @@ impl Code {
     /// `BYTECODE_PADDING` STOP bytes and records the original length in
     /// `bytecode_len`. Never pass a pre-padded buffer, or the logical length and
     /// every `JUMPDEST`/`PUSH` offset derived from it would be wrong.
-    pub fn from_parts_unchecked(hash: H256, code: &[u8], jump_targets: Arc<[u32]>) -> Self {
+    pub fn from_parts_unchecked(hash: H256, code: &[u8], jump_targets: JumpTargets) -> Self {
         let bytecode_len = code.len();
         let mut padded_code = Vec::with_capacity(bytecode_len + BYTECODE_PADDING);
         padded_code.extend_from_slice(code);
@@ -88,35 +188,6 @@ impl Code {
             bytecode: Bytes::from_owner(padded_code),
             bytecode_len,
             jump_targets,
-        }
-    }
-
-    fn compute_jump_targets(code: &[u8]) -> Arc<[u32]> {
-        debug_assert!(code.len() <= u32::MAX as usize);
-        let mut targets = Vec::new();
-        let mut i = 0;
-        while i < code.len() {
-            // TODO: we don't use the constants from the vm module to avoid a circular dependency
-            match code[i] {
-                // OP_JUMPDEST
-                0x5B => {
-                    targets.push(i as u32);
-                }
-                // OP_PUSH1..32
-                c @ 0x60..0x80 => {
-                    // OP_PUSH0
-                    i += (c - 0x5F) as usize;
-                }
-                _ => (),
-            }
-            i += 1;
-        }
-        // Share the single empty table for jumpless bytecode (very common: EOAs,
-        // tiny contracts) so we don't allocate an `Arc` header for an empty slice.
-        if targets.is_empty() {
-            EMPTY_JUMP_TARGETS.clone()
-        } else {
-            Arc::from(targets)
         }
     }
 
@@ -159,7 +230,7 @@ impl Code {
     pub fn size(&self) -> usize {
         let hash_size = size_of::<H256>();
         let bytes_size = size_of::<Bytes>();
-        let vec_size = size_of::<Arc<[u32]>>() + self.jump_targets.len() * size_of::<u32>();
+        let vec_size = size_of::<JumpTargets>() + self.jump_targets.heap_size();
         hash_size + bytes_size + vec_size
     }
 }
@@ -182,7 +253,7 @@ impl Serialize for Code {
         CodeSerde {
             hash: self.hash,
             code: self.code_bytes(),
-            jump_targets: self.jump_targets.clone(),
+            jump_targets: self.jump_targets.to_offsets().into(),
         }
         .serialize(serializer)
     }
@@ -195,6 +266,7 @@ impl<'de> Deserialize<'de> for Code {
             code,
             jump_targets,
         } = CodeSerde::deserialize(deserializer)?;
+        let jump_targets = JumpTargets::from_offsets(&jump_targets, code.len());
         Ok(Self::from_parts_unchecked(hash, &code, jump_targets))
     }
 }
@@ -263,7 +335,7 @@ impl Default for Code {
             bytecode: Bytes::from_static(&[0u8; BYTECODE_PADDING]),
             bytecode_len: 0,
             hash: *EMPTY_KECCAK_HASH,
-            jump_targets: EMPTY_JUMP_TARGETS.clone(),
+            jump_targets: JumpTargets::default(),
         }
     }
 }
@@ -498,6 +570,150 @@ mod test {
     use std::str::FromStr;
 
     use super::*;
+
+    /// The analysis `JumpTargets` replaced, kept verbatim as the reference: the
+    /// valid `JUMPDEST` offsets in increasing order.
+    fn reference_jump_targets(code: &[u8]) -> Vec<u32> {
+        let mut targets = Vec::new();
+        let mut i = 0;
+        while i < code.len() {
+            match code[i] {
+                0x5B => {
+                    targets.push(i as u32);
+                }
+                c @ 0x60..0x80 => {
+                    i += (c - 0x5F) as usize;
+                }
+                _ => (),
+            }
+            i += 1;
+        }
+        targets
+    }
+
+    /// The check `JUMP`/`JUMPI` made before the bitmap, on the padded dispatch
+    /// buffer: the byte at `target` is a `JUMPDEST` and `target` is in the list.
+    fn reference_valid(padded: &[u8], targets: &[u32], target: usize) -> bool {
+        padded
+            .get(target)
+            .is_some_and(|&value| value == 0x5B && targets.binary_search(&(target as u32)).is_ok())
+    }
+
+    /// The check `JUMP`/`JUMPI` makes now (levm's `jump`).
+    fn bitmap_valid(code: &Code, target: usize) -> bool {
+        code.dispatch_buf()
+            .get(target)
+            .is_some_and(|&value| value == 0x5B && code.jump_targets.contains(target))
+    }
+
+    /// Every destination of `bytecode` is judged alike by both checks, the
+    /// bitmap holds exactly the reference's offsets, and it survives the
+    /// round-trip through the offset list that serialization and storage use.
+    fn assert_same_destinations(bytecode: &[u8]) {
+        let code = Code::from_bytecode_unchecked(Bytes::copy_from_slice(bytecode), H256::zero());
+        let reference = reference_jump_targets(bytecode);
+        assert_eq!(
+            code.jump_targets.to_offsets(),
+            reference,
+            "offsets of {bytecode:02x?}"
+        );
+        let mut padded = bytecode.to_vec();
+        padded.extend_from_slice(&[0u8; BYTECODE_PADDING]);
+        let far = [
+            u32::MAX as usize,
+            u32::MAX as usize + 1,
+            (1usize << 40) + 0x5B,
+            usize::MAX,
+        ];
+        for target in (0..bytecode.len() + BYTECODE_PADDING + 70).chain(far) {
+            assert_eq!(
+                bitmap_valid(&code, target),
+                reference_valid(&padded, &reference, target),
+                "destination {target} of {bytecode:02x?}"
+            );
+        }
+        assert_eq!(
+            JumpTargets::from_offsets(&reference, bytecode.len()),
+            code.jump_targets,
+            "round-trip of {bytecode:02x?}"
+        );
+    }
+
+    #[test]
+    fn jump_targets_edge_cases_match_the_reference_analysis() {
+        // Empty code, a lone JUMPDEST, PUSH0 (no immediate) before a JUMPDEST.
+        assert_same_destinations(&[]);
+        assert_same_destinations(&[0x5B]);
+        assert_same_destinations(&[0x5F, 0x5B]);
+        // A JUMPDEST inside push data is not a destination; the one after it is.
+        assert_same_destinations(&[0x60, 0x5B, 0x5B]);
+        // Code ending mid-push: the truncated immediate holds JUMPDEST bytes.
+        assert_same_destinations(&[0x61, 0x5B]);
+        assert_same_destinations(&[0x5B, 0x7F, 0x5B, 0x5B, 0x5B]);
+        // PUSH32 as the very last byte, and PUSH32 with a full immediate of JUMPDESTs.
+        assert_same_destinations(&[0x5B, 0x7F]);
+        let mut full = vec![0x7F];
+        full.extend_from_slice(&[0x5B; 32]);
+        full.push(0x5B);
+        assert_same_destinations(&full);
+        // Every PUSHn followed by n JUMPDEST bytes, then a real JUMPDEST.
+        for n in 1..=32u8 {
+            let mut code = vec![0x5F + n];
+            code.extend(std::iter::repeat_n(0x5B, n as usize));
+            code.push(0x5B);
+            assert_same_destinations(&code);
+            // and cut one byte short of its immediate
+            code.truncate(n as usize);
+            assert_same_destinations(&code);
+        }
+        // Destinations on and around 64-bit word boundaries.
+        for len in [63usize, 64, 65, 127, 128, 129, 200] {
+            assert_same_destinations(&vec![0x5B; len]);
+            let mut code = vec![0x00; len];
+            for i in [0, 62, 63, 64, 65, 126, 127, 128] {
+                if i < len {
+                    code[i] = 0x5B;
+                }
+            }
+            assert_same_destinations(&code);
+        }
+    }
+
+    #[test]
+    fn jump_targets_match_the_reference_analysis_on_random_code() {
+        // xorshift64*, seeded: the same codes on every run.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..4000 {
+            let len = (next() % 700) as usize;
+            let code: Vec<u8> = (0..len)
+                .map(|_| match next() % 8 {
+                    // JUMPDEST and the push opcodes are the bytes the analysis reads.
+                    0 | 1 => 0x5B,
+                    2 | 3 => 0x60 + (next() % 32) as u8,
+                    _ => next() as u8,
+                })
+                .collect();
+            assert_same_destinations(&code);
+        }
+    }
+
+    #[test]
+    fn jump_targets_from_offsets_drops_offsets_past_the_code() {
+        let code = [0x5B, 0x00, 0x5B];
+        let computed = JumpTargets::compute(&code);
+        assert_eq!(
+            JumpTargets::from_offsets(&[0, 2, 3, 40, u32::MAX], 3),
+            computed
+        );
+        assert_eq!(JumpTargets::from_offsets(&[5], 3), JumpTargets::default());
+        assert_eq!(JumpTargets::compute(&[]), JumpTargets::default());
+    }
 
     #[test]
     fn test_code_hash() {

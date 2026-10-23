@@ -478,12 +478,7 @@ fn jump(vm: &mut VM<'_>, target: usize, parent_gas_cost: u64) -> Result<(), VMEr
         .get(target)
         .is_some_and(|&value| {
             value == Opcode::JUMPDEST as u8
-                && vm
-                    .current_call_frame
-                    .bytecode
-                    .jump_targets
-                    .binary_search(&(target as u32))
-                    .is_ok()
+                && vm.current_call_frame.bytecode.jump_targets.contains(target)
         })
     {
         if vm.opcode_tracer.active {
