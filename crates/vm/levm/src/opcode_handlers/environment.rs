@@ -26,7 +26,7 @@ use crate::{
     utils::{size_offset_to_usize, u256_to_usize, word_to_address},
     vm::VM,
 };
-use ethrex_common::U256;
+use ethrex_common::{U256, utils::u256_from_be_bytes};
 use std::mem;
 
 /// Implementation for the `ADDRESS` opcode.
@@ -158,11 +158,15 @@ impl OpcodeHandler for OpCallDataLoadHandler {
             .and_then(|offset| vm.current_call_frame.calldata.get(offset..));
         #[expect(clippy::indexing_slicing, reason = "length is checked in match guard")]
         vm.current_call_frame.stack.push(match value_bytes {
-            Some(data) if data.len() >= 32 => U256::from_big_endian(&data[..32]),
+            Some(data) if data.len() >= 32 => {
+                let mut bytes = [0; 32];
+                bytes.copy_from_slice(&data[..32]);
+                u256_from_be_bytes(&bytes)
+            }
             Some(data) => {
                 let mut bytes = [0; 32];
                 bytes[..data.len()].copy_from_slice(data);
-                U256::from_big_endian(&bytes)
+                u256_from_be_bytes(&bytes)
             }
             None => U256::zero(),
         })?;

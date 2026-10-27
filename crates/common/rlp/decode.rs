@@ -210,7 +210,7 @@ impl RLPDecode for U256 {
     fn decode_unfinished(rlp: &[u8]) -> Result<(Self, &[u8]), RLPDecodeError> {
         let (bytes, rest) = decode_bytes(rlp)?;
         let padded_bytes: [u8; 32] = static_left_pad(bytes)?;
-        Ok((U256::from_big_endian(&padded_bytes), rest))
+        Ok((crate::byte_order::u256_from_be_bytes(&padded_bytes), rest))
     }
 }
 

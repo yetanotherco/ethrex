@@ -5,6 +5,14 @@ use hex::FromHexError;
 
 pub const ZERO_U256: U256 = U256([0, 0, 0, 0]);
 
+pub use ethrex_rlp::byte_order::{swap_bytes_u64, u256_from_be_bytes, u256_to_be_bytes};
+
+/// `u64::from_be_bytes` through [`swap_bytes_u64`].
+#[inline(always)]
+fn u64_from_be(bytes: [u8; 8]) -> u64 {
+    swap_bytes_u64(u64::from_le_bytes(bytes))
+}
+
 /// Converts a big endian slice to a u256, faster than `u256::from_big_endian`.
 pub fn u256_from_big_endian(slice: &[u8]) -> U256 {
     let mut padded = [0u8; 32];
@@ -15,7 +23,7 @@ pub fn u256_from_big_endian(slice: &[u8]) -> U256 {
     let mut u64_bytes = [0u8; 8];
     for i in 0..4 {
         u64_bytes.copy_from_slice(&padded[8 * i..(8 * i + 8)]);
-        ret[4 - i - 1] = u64::from_be_bytes(u64_bytes);
+        ret[4 - i - 1] = u64_from_be(u64_bytes);
     }
 
     U256(ret)
@@ -35,7 +43,14 @@ pub fn u256_from_big_endian_const<const N: usize>(slice: [u8; N]) -> U256 {
     let mut u64_bytes = [0u8; 8];
     for i in 0..4 {
         u64_bytes.copy_from_slice(&padded[8 * i..(8 * i + 8)]);
-        ret[4 - i - 1] = u64::from_be_bytes(u64_bytes);
+        // A word that is partly or wholly zero padding keeps `from_be_bytes`: LLVM
+        // knows those bytes are zero and shortens the swap itself (PUSH1 and PUSH2
+        // are the commonest PUSHes).
+        ret[4 - i - 1] = if N >= 32 - 8 * i {
+            u64_from_be(u64_bytes)
+        } else {
+            u64::from_be_bytes(u64_bytes)
+        };
     }
 
     U256(ret)
@@ -44,14 +59,7 @@ pub fn u256_from_big_endian_const<const N: usize>(slice: [u8; N]) -> U256 {
 /// Converts a U256 to a big endian slice.
 #[inline(always)]
 pub fn u256_to_big_endian(value: U256) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-
-    for i in 0..4 {
-        let u64_be = value.0[4 - i - 1].to_be_bytes();
-        bytes[8 * i..(8 * i + 8)].copy_from_slice(&u64_be);
-    }
-
-    bytes
+    u256_to_be_bytes(value)
 }
 
 #[inline(always)]
