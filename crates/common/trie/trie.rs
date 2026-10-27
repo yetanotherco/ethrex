@@ -22,6 +22,7 @@ pub mod node;
 mod node_hash;
 pub mod rkyv_utils;
 mod rlp;
+mod sorted_root;
 #[cfg(test)]
 mod test_utils;
 // Parallel merkleization (std threads + crossbeam) is host-only.
@@ -514,6 +515,25 @@ impl Trie {
         }
 
         trie.hash_no_commit(crypto)
+    }
+
+    /// The same hash as [`Trie::compute_hash_from_unsorted_iter`], for pairs whose paths
+    /// come in strictly increasing order with none a prefix of the next (as RLP-encoded
+    /// indices do when listed in their byte order). Each node is then built and hashed
+    /// once, with no insertion into a trie first. Pairs out of that order fall back to
+    /// [`Trie::compute_hash_from_unsorted_iter`].
+    pub fn compute_hash_from_sorted_iter(
+        iter: impl Iterator<Item = (PathRLP, ValueRLP)>,
+        crypto: &dyn Crypto,
+    ) -> H256 {
+        let mut entries: Vec<(PathRLP, ValueRLP)> = iter.collect();
+        if entries.is_empty() {
+            return EMPTY_TRIE_HASH;
+        }
+        match sorted_root::sorted_root(&mut entries, crypto) {
+            Some(root) => root.finalize(crypto),
+            None => Self::compute_hash_from_unsorted_iter(entries.into_iter(), crypto),
+        }
     }
 
     /// Creates a new stateless trie. This trie won't be able to store any nodes so all data will be lost after calculating the hash

@@ -355,22 +355,38 @@ impl BlockBody {
     }
 }
 
+/// The indices `0..len` in the byte order of their RLP encodings, the keys of the
+/// transactions, receipts and withdrawals tries: 1 to 127 (one byte, 0x01..=0x7f),
+/// then 0 (0x80), then 128 onwards (0x81 xx, 0x82 xx xx, ... in numeric order).
+/// The encodings are prefix-free, so the tries can be built from pairs in this order
+/// with [`Trie::compute_hash_from_sorted_iter`].
+fn indices_in_key_order(len: usize) -> impl Iterator<Item = usize> {
+    (1..len.min(128))
+        .chain((len > 0).then_some(0))
+        .chain(128..len)
+}
+
 pub fn compute_transactions_root(transactions: &[Transaction], crypto: &dyn Crypto) -> H256 {
-    let iter = transactions.iter().enumerate().map(|(idx, tx)| {
+    let iter = indices_in_key_order(transactions.len()).map(|idx| {
         // Key: RLP(tx_index)
         // Value: tx_type || RLP(tx)  if tx_type != 0
         //                   RLP(tx)  else
-        (idx.encode_to_vec(), tx.encode_canonical_to_vec())
+        (
+            idx.encode_to_vec(),
+            transactions[idx].encode_canonical_to_vec(),
+        )
     });
-    Trie::compute_hash_from_unsorted_iter(iter, crypto)
+    Trie::compute_hash_from_sorted_iter(iter, crypto)
 }
 
 pub fn compute_receipts_root(receipts: &[Receipt], crypto: &dyn Crypto) -> H256 {
-    let iter = receipts
-        .iter()
-        .enumerate()
-        .map(|(idx, receipt)| (idx.encode_to_vec(), receipt.encode_inner_with_bloom(crypto)));
-    Trie::compute_hash_from_unsorted_iter(iter, crypto)
+    let iter = indices_in_key_order(receipts.len()).map(|idx| {
+        (
+            idx.encode_to_vec(),
+            receipts[idx].encode_inner_with_bloom(crypto),
+        )
+    });
+    Trie::compute_hash_from_sorted_iter(iter, crypto)
 }
 
 /// Computes the receipts root and the aggregate header `logs_bloom` in a single pass,
@@ -382,7 +398,8 @@ pub fn compute_receipts_root_and_logs_bloom(
     crypto: &dyn Crypto,
 ) -> (H256, Bloom) {
     let mut logs_bloom = Bloom::zero();
-    let iter = receipts.iter().enumerate().map(|(idx, receipt)| {
+    let iter = indices_in_key_order(receipts.len()).map(|idx| {
+        let receipt = &receipts[idx];
         let bloom = crate::types::bloom_from_logs(&receipt.logs, crypto);
         logs_bloom |= bloom;
         (
@@ -390,17 +407,15 @@ pub fn compute_receipts_root_and_logs_bloom(
             receipt.encode_inner_with_precomputed_bloom(bloom),
         )
     });
-    let receipts_root = Trie::compute_hash_from_unsorted_iter(iter, crypto);
+    let receipts_root = Trie::compute_hash_from_sorted_iter(iter, crypto);
     (receipts_root, logs_bloom)
 }
 
 // See [EIP-4895](https://eips.ethereum.org/EIPS/eip-4895)
 pub fn compute_withdrawals_root(withdrawals: &[Withdrawal], crypto: &dyn Crypto) -> H256 {
-    let iter = withdrawals
-        .iter()
-        .enumerate()
-        .map(|(idx, withdrawal)| (idx.encode_to_vec(), withdrawal.encode_to_vec()));
-    Trie::compute_hash_from_unsorted_iter(iter, crypto)
+    let iter = indices_in_key_order(withdrawals.len())
+        .map(|idx| (idx.encode_to_vec(), withdrawals[idx].encode_to_vec()));
+    Trie::compute_hash_from_sorted_iter(iter, crypto)
 }
 
 impl RLPEncode for BlockBody {
@@ -943,6 +958,18 @@ pub fn calc_excess_blob_gas(parent: &BlockHeader, schedule: ForkBlobSchedule, fo
 
 #[cfg(test)]
 mod test {
+
+    #[test]
+    fn indices_in_key_order_list_every_index_once_in_rlp_byte_order() {
+        for len in (0..=600usize).chain([65535, 65536, 65537, 70000]) {
+            let keys: Vec<Vec<u8>> = indices_in_key_order(len)
+                .map(|i| i.encode_to_vec())
+                .collect();
+            assert_eq!(keys.len(), len, "{len}");
+            assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "{len}");
+        }
+    }
+
     use super::*;
     use crate::constants::EMPTY_KECCAK_HASH;
     use crate::types::{BLOB_BASE_FEE_UPDATE_FRACTION, ELASTICITY_MULTIPLIER};
