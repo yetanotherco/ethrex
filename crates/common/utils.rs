@@ -62,6 +62,45 @@ pub fn u256_to_big_endian(value: U256) -> [u8; 32] {
     u256_to_be_bytes(value)
 }
 
+/// Whether the byte swap is a sequence of instructions worth skipping for a
+/// zero word (a target without a byte-reverse instruction).
+const SWAP_IS_SOFTWARE: bool = cfg!(all(target_arch = "riscv64", not(target_feature = "zbb")));
+
+/// [`u256_from_big_endian_const`] of an EVM memory word, skipping the byte swap of
+/// zero limbs: memory words are often small numbers or zero.
+#[inline(always)]
+pub fn u256_from_big_endian_for_memory(value: [u8; 32]) -> U256 {
+    let mut limbs = [0u64; 4];
+    for (i, chunk) in value.chunks_exact(8).enumerate() {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(chunk);
+        let word = u64::from_le_bytes(bytes);
+        limbs[3 - i] = if SWAP_IS_SOFTWARE && word == 0 {
+            0
+        } else {
+            swap_bytes_u64(word)
+        };
+    }
+    U256(limbs)
+}
+
+/// [`u256_to_big_endian`] for an EVM memory word, skipping the byte swap of zero
+/// limbs.
+#[inline(always)]
+pub fn u256_to_big_endian_for_memory(value: U256) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    for i in 0..4 {
+        let word = value.0[3 - i];
+        let swapped = if SWAP_IS_SOFTWARE && word == 0 {
+            0
+        } else {
+            swap_bytes_u64(word)
+        };
+        bytes[8 * i..8 * i + 8].copy_from_slice(&swapped.to_le_bytes());
+    }
+    bytes
+}
+
 #[inline(always)]
 pub fn u256_to_h256(value: U256) -> H256 {
     H256(u256_to_big_endian(value))
@@ -85,4 +124,35 @@ pub fn truncate_array<const N: usize, const M: usize>(data: [u8; N]) -> [u8; M] 
     let mut res = [0u8; M];
     res.copy_from_slice(&data[..M]);
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_word_conversions_match_the_general_ones() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for round in 0..20_000u32 {
+            // every pattern of zero limbs, with random or all-ones others
+            let mut limbs = [0u64; 4];
+            for (i, limb) in limbs.iter_mut().enumerate() {
+                if round & (1 << i) != 0 {
+                    *limb = if round & 16 != 0 { u64::MAX } else { next() };
+                }
+            }
+            let value = U256(limbs);
+            let bytes = u256_to_big_endian(value);
+            assert_eq!(u256_to_big_endian_for_memory(value), bytes, "{value:#x}");
+            assert_eq!(u256_from_big_endian_for_memory(bytes), value, "{value:#x}");
+            assert_eq!(u256_from_big_endian_const(bytes), value, "{value:#x}");
+            assert_eq!(value.to_big_endian(), bytes, "{value:#x}");
+        }
+    }
 }
