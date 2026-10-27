@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use bytes::{BufMut, Bytes};
@@ -26,12 +27,16 @@ struct JumpAnalysis {
     targets: OnceLock<Arc<[u32]>>,
     bitmap: OnceLock<Arc<[u64]>>,
     progressive: Mutex<ProgressiveAnalysis>,
+    // The progressive scan's results, readable without the lock: `scanned` bytes
+    // are analysed (published with Release after their bits), and `words` holds
+    // their valid destinations, allocated at the first JUMPDEST found.
+    scanned: AtomicUsize,
+    words: OnceLock<Box<[AtomicU64]>>,
 }
 #[derive(Debug, Default)]
 struct ProgressiveAnalysis {
     // First opcode not yet analyzed. A PUSH may advance beyond logical EOF.
     next_pc: usize,
-    words: Vec<u64>,
 }
 
 static EMPTY_JUMP_BITMAP: LazyLock<Arc<[u64]>> = LazyLock::new(|| Arc::from([]));
@@ -40,7 +45,7 @@ static EMPTY_JUMP_ANALYSIS: LazyLock<Arc<JumpAnalysis>> = LazyLock::new(|| {
     Arc::new(JumpAnalysis {
         targets: OnceLock::from(Arc::from([])),
         bitmap: OnceLock::from(EMPTY_JUMP_BITMAP.clone()),
-        progressive: Mutex::default(),
+        ..JumpAnalysis::default()
     })
 });
 
@@ -117,7 +122,7 @@ impl Code {
             analysis: Arc::new(JumpAnalysis {
                 bitmap: OnceLock::from(Self::make_jump_bitmap(code, &jump_targets)),
                 targets: OnceLock::from(jump_targets),
-                progressive: Mutex::default(),
+                ..JumpAnalysis::default()
             }),
         }
     }
@@ -173,18 +178,26 @@ impl Code {
                 .get(target / 64)
                 .is_some_and(|word| word & (1u64 << (target % 64)) != 0);
         }
+        // A target inside the scanned prefix is answered without the lock.
+        if target >= self.analysis.scanned.load(Ordering::Acquire) {
+            self.scan_through(target);
+        }
+        self.analysis.words.get().is_some_and(|words| {
+            words
+                .get(target / 64)
+                .is_some_and(|word| word.load(Ordering::Relaxed) & (1u64 << (target % 64)) != 0)
+        })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn scan_through(&self, target: usize) {
         let mut analysis = self
             .analysis
             .progressive
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if analysis.next_pc <= target {
-            self.analyze_through(&mut analysis, target);
-        }
-        analysis
-            .words
-            .get(target / 64)
-            .is_some_and(|word| word & (1u64 << (target % 64)) != 0)
+        self.analyze_through(&mut analysis, target);
     }
 
     fn compute_jump_bitmap(&self) -> Arc<[u64]> {
@@ -197,7 +210,13 @@ impl Code {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         self.analyze_through(&mut analysis, self.len() - 1);
-        Arc::from(analysis.words.as_slice())
+        match self.analysis.words.get() {
+            Some(words) => words
+                .iter()
+                .map(|word| word.load(Ordering::Relaxed))
+                .collect(),
+            None => EMPTY_JUMP_BITMAP.clone(),
+        }
     }
 
     // Scanning and allocation are rare once the queried prefix is cached.
@@ -214,6 +233,7 @@ impl Code {
         }
         let mut cursor = unsafe { start.add(analysis.next_pc) };
         let limit = unsafe { start.add(target) };
+        let mut words = self.analysis.words.get();
         macro_rules! scan_opcode {
             () => {{
                 // Constructors append 33 STOP bytes. We only read logical bytes;
@@ -224,10 +244,16 @@ impl Code {
                 } else {
                     if opcode == 0x5b {
                         let offset = cursor as usize - start as usize;
-                        if analysis.words.is_empty() {
-                            analysis.words.resize(self.len().div_ceil(64), 0);
-                        }
-                        analysis.words[offset / 64] |= 1u64 << (offset % 64);
+                        let words = *words.get_or_insert_with(|| {
+                            self.analysis.words.get_or_init(|| {
+                                (0..self.len().div_ceil(64))
+                                    .map(|_| AtomicU64::new(0))
+                                    .collect()
+                            })
+                        });
+                        // Only the scan, under the lock, writes; readers see these
+                        // bits once `scanned` is published below.
+                        words[offset / 64].fetch_or(1u64 << (offset % 64), Ordering::Relaxed);
                     }
                     cursor = unsafe { cursor.add(1) };
                 }
@@ -253,6 +279,9 @@ impl Code {
             scan_opcode!();
         }
         analysis.next_pc = cursor as usize - start as usize;
+        self.analysis
+            .scanned
+            .store(analysis.next_pc, Ordering::Release);
     }
 
     #[inline]
@@ -305,12 +334,9 @@ impl Code {
             .map_or(0, |v| v.len() * size_of::<u64>());
         let progressive = self
             .analysis
-            .progressive
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
             .words
-            .capacity()
-            * size_of::<u64>();
+            .get()
+            .map_or(0, |words| words.len() * size_of::<AtomicU64>());
         size_of::<Self>()
             + self.bytecode.len()
             + size_of::<JumpAnalysis>()

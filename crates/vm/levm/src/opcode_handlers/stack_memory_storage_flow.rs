@@ -480,6 +480,7 @@ impl OpcodeHandler for OpJumpIHandler {
 /// override for the parent JUMP/JUMPI step (so its `gasCost` doesn't absorb the
 /// JUMPDEST charge), and the JUMPDEST step is pushed directly via
 /// `synthesize_step` after the gas is charged.
+#[inline(always)]
 fn jump(vm: &mut VM<'_>, target: usize, parent_gas_cost: u64) -> Result<(), VMError> {
     // Check target address validity.
     //   - Target bytecode has to be a JUMPDEST.
