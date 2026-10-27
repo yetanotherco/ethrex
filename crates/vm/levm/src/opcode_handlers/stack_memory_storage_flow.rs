@@ -484,17 +484,7 @@ fn jump(vm: &mut VM<'_>, target: usize, parent_gas_cost: u64) -> Result<(), VMEr
     // Check target address validity.
     //   - Target bytecode has to be a JUMPDEST.
     //   - Target address must not be blacklisted (aka. the JUMPDEST must not be part of a literal).
-    #[expect(clippy::as_conversions, reason = "safe")]
-    if vm
-        .current_call_frame
-        .bytecode
-        .dispatch_buf()
-        .get(target)
-        .is_some_and(|&value| {
-            value == Opcode::JUMPDEST as u8
-                && vm.current_call_frame.bytecode.jump_targets.contains(target)
-        })
-    {
+    if vm.current_call_frame.bytecode.is_valid_jump_target(target) {
         if vm.opcode_tracer.active {
             return jump_traced(vm, target, parent_gas_cost);
         }

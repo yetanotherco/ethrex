@@ -7,10 +7,12 @@
 
 use bytes::Bytes;
 use ethrex_common::H256;
-use ethrex_common::types::{BYTECODE_PADDING, Code, JumpTargets};
+use std::sync::Arc;
+
+use ethrex_common::types::{BYTECODE_PADDING, Code};
 use ethrex_guest_program::l1::ProgramInput;
 
-/// The analysis `JumpTargets` replaced, verbatim: the valid `JUMPDEST` offsets.
+/// The upstream analysis, verbatim: the valid `JUMPDEST` offsets.
 fn reference_jump_targets(code: &[u8]) -> Vec<u32> {
     let mut targets = Vec::new();
     let mut i = 0;
@@ -46,29 +48,30 @@ fn every_witness_bytecode_has_the_reference_jump_destinations() {
             let code =
                 Code::from_bytecode_unchecked(Bytes::copy_from_slice(bytecode), H256::zero());
             let reference = reference_jump_targets(bytecode);
-            assert_eq!(
-                code.jump_targets.to_offsets(),
-                reference,
-                "{}",
-                path.display()
-            );
-            assert_eq!(
-                JumpTargets::from_offsets(&reference, bytecode.len()),
-                code.jump_targets
-            );
             let mut padded = bytecode.clone();
             padded.extend_from_slice(&[0u8; BYTECODE_PADDING]);
             for target in 0..padded.len() + 64 {
                 let old = padded.get(target).is_some_and(|&v| {
                     v == 0x5B && reference.binary_search(&(target as u32)).is_ok()
                 });
-                let new = code
-                    .dispatch_buf()
-                    .get(target)
-                    .is_some_and(|&v| v == 0x5B && code.jump_targets.contains(target));
-                assert_eq!(new, old, "{} destination {target}", path.display());
+                // asked in increasing order first: the progressive analysis
+                assert_eq!(
+                    code.is_valid_jump_target(target),
+                    old,
+                    "{} destination {target}",
+                    path.display()
+                );
                 targets_checked += 1;
             }
+            assert_eq!(
+                code.jump_targets(),
+                reference.as_slice(),
+                "{}",
+                path.display()
+            );
+            let rebuilt =
+                Code::from_parts_unchecked(H256::zero(), bytecode, Arc::from(reference.as_slice()));
+            assert_eq!(rebuilt, code, "{}", path.display());
             codes += 1;
             bytes += bytecode.len();
             destinations += reference.len();

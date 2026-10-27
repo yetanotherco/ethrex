@@ -28,7 +28,7 @@ use ethrex_common::{
     types::{
         AccountInfo, AccountState, AccountUpdate, Block, BlockBody, BlockHash, BlockHeader,
         BlockNumber, ChainConfig, Code, CodeMetadata, ForkId, Genesis, GenesisAccount, Index,
-        JumpTargets, Receipt, Transaction,
+        Receipt, Transaction,
         block_access_list::BlockAccessList,
         block_execution_witness::{ExecutionWitness, RpcExecutionWitness},
     },
@@ -927,9 +927,11 @@ impl Store {
             return Ok(None);
         };
         let (bytecode_slice, targets) = decode_bytes(&bytes)?;
-        let jump_targets =
-            JumpTargets::from_offsets(&<Vec<u32>>::decode(targets)?, bytecode_slice.len());
-        let code = Code::from_parts_unchecked(code_hash, bytecode_slice, jump_targets);
+        let code = Code::from_parts_unchecked(
+            code_hash,
+            bytecode_slice,
+            <Vec<u32>>::decode(targets)?.into(),
+        );
 
         // insert into cache and evict if needed
         self.account_code_cache
@@ -5233,12 +5235,12 @@ pub fn receipt_key(block_hash: &BlockHash, index: u64) -> Vec<u8> {
 }
 
 fn encode_code(code: &Code) -> Vec<u8> {
-    // The bitmap persists as the list of valid offsets it replaces, so the stored
-    // format is unchanged; this is a cold DB-write path (once per code hash).
-    let offsets = code.jump_targets.to_offsets();
-    let mut buf = Vec::with_capacity(6 + code.len() + std::mem::size_of_val::<[u32]>(&offsets));
+    let mut buf =
+        Vec::with_capacity(6 + code.len() + std::mem::size_of_val::<[u32]>(code.jump_targets()));
     code.code().encode(&mut buf);
-    offsets.encode(&mut buf);
+    // `Arc<[u32]>` (the in-memory share) has no `RLPEncode` impl; encode through an
+    // owned `Vec` on this cold DB-write path (code is persisted once per hash).
+    code.jump_targets().to_vec().encode(&mut buf);
     buf
 }
 
