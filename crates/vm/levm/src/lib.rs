@@ -87,6 +87,16 @@ pub mod account;
 pub mod execute_precompile;
 #[cfg(feature = "perf_opcode_timings")]
 pub mod timings;
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::indexing_slicing
+)]
+mod warm_set_tests;
 
 /// Trait for stateless block validation, used by the EXECUTE precompile.
 ///

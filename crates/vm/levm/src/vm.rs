@@ -39,7 +39,7 @@ use ethrex_crypto::Crypto;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     cell::{OnceCell, RefCell},
-    collections::{BTreeMap, BTreeSet, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet},
     mem,
     rc::Rc,
 };
@@ -65,6 +65,46 @@ fn union_into<T: Eq + std::hash::Hash>(into: &mut FxHashSet<T>, mut other: FxHas
         mem::swap(into, &mut other);
     }
     into.extend(other);
+}
+
+/// One undoable insertion into a [`WarmSet`].
+#[derive(Debug, Clone, Copy)]
+enum WarmEntry {
+    Address(Address),
+    Slot(Address, H256),
+}
+
+/// Warm addresses and storage slots of a transaction (EIP-2929), kept in one place for every
+/// checkpoint, with a journal of insertions so a reverted checkpoint can take its own back out.
+///
+/// A lookup is one probe however deep the call stack is, and committing a checkpoint costs
+/// nothing; reverting one removes exactly the entries inserted since it was pushed.
+#[derive(Debug, Default)]
+struct WarmSet {
+    addresses: FxHashSet<Address>,
+    slots: FxHashSet<(Address, H256)>,
+    /// Addresses the access list named, with or without storage keys; `make_access_list` reports
+    /// each of them, as it always has.
+    listed: Vec<Address>,
+    /// Insertions made while a checkpoint was open, oldest first.
+    journal: Vec<WarmEntry>,
+}
+
+impl WarmSet {
+    /// Remove every insertion made after the journal had `checkpoint` entries.
+    fn undo_to(&mut self, checkpoint: usize) {
+        while self.journal.len() > checkpoint {
+            match self.journal.pop() {
+                Some(WarmEntry::Address(address)) => {
+                    self.addresses.remove(&address);
+                }
+                Some(WarmEntry::Slot(address, key)) => {
+                    self.slots.remove(&(address, key));
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 /// Execution substate that tracks changes during transaction execution.
@@ -96,11 +136,13 @@ pub struct Substate {
     fork: Fork,
     /// Accounts marked for self-destruction (deleted at end of transaction).
     selfdestruct_set: FxHashSet<Address>,
-    /// Addresses accessed during execution (for EIP-2929 warm/cold gas costs).
-    /// Precompiles are NOT stored here; they are warm by construction (see `is_warm_precompile`).
-    accessed_addresses: FxHashSet<Address>,
-    /// Storage slots accessed per address (for EIP-2929 warm/cold gas costs).
-    accessed_storage_slots: FxHashMap<Address, FxHashSet<H256>>,
+    /// Addresses and storage slots accessed during execution (for EIP-2929 warm/cold gas
+    /// costs). Only the innermost checkpoint holds them; `push_backup`, `commit_backup` and
+    /// `revert_backup` hand them on. Precompiles are NOT stored here; they are warm by
+    /// construction (see `is_warm_precompile`).
+    warm: WarmSet,
+    /// Length of `warm`'s journal when this checkpoint was pushed.
+    warm_checkpoint: usize,
     /// Accounts created during this transaction.
     created_accounts: FxHashSet<Address>,
     /// Accumulated gas refund (e.g., from storage clears).
@@ -117,12 +159,22 @@ impl Substate {
         accessed_addresses: FxHashSet<Address>,
         accessed_storage_slots: FxHashMap<Address, FxHashSet<H256>>,
     ) -> Self {
+        let listed = accessed_storage_slots.keys().copied().collect();
+        let slots = accessed_storage_slots
+            .into_iter()
+            .flat_map(|(address, keys)| keys.into_iter().map(move |key| (address, key)))
+            .collect();
         Self {
             parent: None,
             fork,
             selfdestruct_set: FxHashSet::default(),
-            accessed_addresses,
-            accessed_storage_slots,
+            warm: WarmSet {
+                addresses: accessed_addresses,
+                slots,
+                listed,
+                journal: Vec::new(),
+            },
+            warm_checkpoint: 0,
             created_accounts: FxHashSet::default(),
             refunded_gas: 0,
             transient_storage: TransientStorage::default(),
@@ -156,10 +208,12 @@ impl Substate {
     /// Push a checkpoint that can be either reverted or committed. All data up to this point is
     /// still accessible.
     pub fn push_backup(&mut self) {
-        let parent = mem::take(self);
+        let mut parent = mem::take(self);
         self.refunded_gas = parent.refunded_gas;
         // Carry the fork forward so child checkpoints keep the same precompile-warmth view.
         self.fork = parent.fork;
+        self.warm = mem::take(&mut parent.warm);
+        self.warm_checkpoint = self.warm.journal.len();
         self.parent = Some(Box::new(parent));
     }
 
@@ -171,16 +225,13 @@ impl Substate {
             let mut delta = mem::take(parent);
             mem::swap(self, &mut delta);
 
-            union_into(&mut self.selfdestruct_set, delta.selfdestruct_set);
-            union_into(&mut self.accessed_addresses, delta.accessed_addresses);
-            for (address, slot_set) in delta.accessed_storage_slots {
-                match self.accessed_storage_slots.entry(address) {
-                    Entry::Occupied(mut entry) => union_into(entry.get_mut(), slot_set),
-                    Entry::Vacant(entry) => {
-                        entry.insert(slot_set);
-                    }
-                }
+            // The child's warm entries stay; they are now the parent's to keep or revert.
+            self.warm = mem::take(&mut delta.warm);
+            if self.parent.is_none() {
+                // Nothing below can revert any more.
+                self.warm.journal.clear();
             }
+            union_into(&mut self.selfdestruct_set, delta.selfdestruct_set);
             union_into(&mut self.created_accounts, delta.created_accounts);
             self.refunded_gas = delta.refunded_gas;
             // The child's values win, so only an empty parent may simply take them.
@@ -202,7 +253,10 @@ impl Substate {
     /// Does nothing if the substate has no backup.
     pub fn revert_backup(&mut self) {
         if let Some(parent) = self.parent.as_mut() {
+            let mut warm = mem::take(&mut self.warm);
+            warm.undo_to(self.warm_checkpoint);
             *self = mem::take(parent);
+            self.warm = warm;
         }
     }
 
@@ -265,20 +319,11 @@ impl Substate {
     /// Build an access list from all accessed storage slots.
     pub fn make_access_list(&self) -> Vec<AccessListEntry> {
         let mut entries = BTreeMap::<Address, BTreeSet<H256>>::new();
-
-        let mut current = self;
-        loop {
-            for (address, slot_set) in &current.accessed_storage_slots {
-                entries
-                    .entry(*address)
-                    .or_default()
-                    .extend(slot_set.iter().copied());
-            }
-
-            current = match current.parent.as_deref() {
-                Some(x) => x,
-                None => break,
-            };
+        for address in &self.warm.listed {
+            entries.entry(*address).or_default();
+        }
+        for (address, key) in &self.warm.slots {
+            entries.entry(*address).or_default().insert(*key);
         }
 
         entries
@@ -290,63 +335,37 @@ impl Substate {
             .collect()
     }
 
-    /// Mark an address as accessed and return whether the slot was cold.
-    pub fn add_accessed_slot(&mut self, address: Address, key: H256) -> bool {
-        if self
-            .accessed_storage_slots
-            .get(&address)
-            .is_some_and(|set| set.contains(&key))
-        {
-            return false;
+    /// Record an insertion into the warm set if a checkpoint is open to revert it.
+    fn journal_warm(&mut self, entry: WarmEntry) {
+        if self.parent.is_some() {
+            self.warm.journal.push(entry);
         }
-
-        let is_present = self
-            .parent
-            .as_ref()
-            .map(|parent| parent.is_slot_accessed(&address, &key))
-            .unwrap_or_default();
-
-        // Note: Do not simplify this expression, it uses `||` to avoid executing the right hand
-        //   expression if not necessary.
-        #[expect(clippy::nonminimal_bool, reason = "order of evaluation matters")]
-        !(is_present
-            || !self
-                .accessed_storage_slots
-                .entry(address)
-                .or_default()
-                .insert(key))
     }
 
-    /// Return whether an address has already been accessed.
+    /// Mark a storage slot as accessed and return whether the slot was cold.
+    pub fn add_accessed_slot(&mut self, address: Address, key: H256) -> bool {
+        let cold = self.warm.slots.insert((address, key));
+        if cold {
+            self.journal_warm(WarmEntry::Slot(address, key));
+        }
+        cold
+    }
+
+    /// Return whether a storage slot has already been accessed.
     pub fn is_slot_accessed(&self, address: &Address, key: &H256) -> bool {
-        self.accessed_storage_slots
-            .get(address)
-            .map(|slot_set| slot_set.contains(key))
-            .unwrap_or_default()
-            || self
-                .parent
-                .as_ref()
-                .map(|parent| parent.is_slot_accessed(address, key))
-                .unwrap_or_default()
+        self.warm.slots.contains(&(*address, *key))
     }
 
     /// Returns all accessed storage slots for a given address.
     /// Used by SELFDESTRUCT to record storage reads in BAL per EIP-7928:
     /// "SELFDESTRUCT: Include modified/read storage keys as storage_read"
     pub fn get_accessed_storage_slots(&self, address: &Address) -> BTreeSet<H256> {
-        let mut slots = BTreeSet::new();
-
-        // Collect from current substate
-        if let Some(slot_set) = self.accessed_storage_slots.get(address) {
-            slots.extend(slot_set.iter().copied());
-        }
-
-        // Collect from parent substates recursively
-        if let Some(parent) = self.parent.as_ref() {
-            slots.extend(parent.get_accessed_storage_slots(address));
-        }
-
-        slots
+        self.warm
+            .slots
+            .iter()
+            .filter(|(owner, _)| owner == address)
+            .map(|(_, key)| *key)
+            .collect()
     }
 
     /// Mark an address as accessed and return whether the address was cold.
@@ -357,33 +376,18 @@ impl Substate {
             return false;
         }
 
-        if self.accessed_addresses.contains(&address) {
-            return false;
+        let cold = self.warm.addresses.insert(address);
+        if cold {
+            self.journal_warm(WarmEntry::Address(address));
         }
-
-        let is_present = self
-            .parent
-            .as_ref()
-            .map(|parent| parent.is_address_accessed(&address))
-            .unwrap_or_default();
-
-        // Note: Do not simplify this expression, it uses `||` to avoid executing the right hand
-        //   expression if not necessary.
-        #[expect(clippy::nonminimal_bool, reason = "order of evaluation matters")]
-        !(is_present || !self.accessed_addresses.insert(address))
+        cold
     }
 
     /// Return whether an address has already been accessed.
     pub fn is_address_accessed(&self, address: &Address) -> bool {
         // Precompiles are always warm; the chain shares one `fork`, so this is consistent across
         // sub-frame substates.
-        self.is_warm_precompile(address)
-            || self.accessed_addresses.contains(address)
-            || self
-                .parent
-                .as_ref()
-                .map(|parent| parent.is_address_accessed(address))
-                .unwrap_or_default()
+        self.is_warm_precompile(address) || self.warm.addresses.contains(address)
     }
 
     /// Mark an address as a new account and return whether is was already marked.
