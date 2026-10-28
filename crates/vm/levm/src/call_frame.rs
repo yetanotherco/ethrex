@@ -621,9 +621,9 @@ impl<'a> VM<'a> {
             .call_frame_backup
             .original_accounts_info;
         for (address, account) in child_call_frame_backup.original_accounts_info.iter() {
-            if parent_backup_accounts.get(address).is_none() {
-                parent_backup_accounts.insert(*address, account.clone());
-            }
+            parent_backup_accounts
+                .entry(*address)
+                .or_insert_with(|| account.clone());
         }
 
         let parent_backup_storage = &mut self
@@ -636,9 +636,7 @@ impl<'a> VM<'a> {
         {
             let parent_storage = parent_backup_storage.entry(*address).or_default();
             for (key, value) in storage {
-                if parent_storage.get(key).is_none() {
-                    parent_storage.insert(*key, *value);
-                }
+                parent_storage.entry(*key).or_insert(*value);
             }
         }
 

@@ -39,7 +39,7 @@ use ethrex_crypto::Crypto;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     cell::{OnceCell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, hash_map::Entry},
     mem,
     rc::Rc,
 };
@@ -55,6 +55,16 @@ pub enum VMType {
     L1,
     /// L2 rollup execution with additional fee handling.
     L2(FeeConfig),
+}
+
+/// `into |= other` for sets, inserting the smaller set's elements into the larger
+/// one instead of always growing `into`: a committed checkpoint's sets are often
+/// larger than its parent's, and a set union does not depend on the order.
+fn union_into<T: Eq + std::hash::Hash>(into: &mut FxHashSet<T>, mut other: FxHashSet<T>) {
+    if other.len() > into.len() {
+        mem::swap(into, &mut other);
+    }
+    into.extend(other);
 }
 
 /// Execution substate that tracks changes during transaction execution.
@@ -161,18 +171,29 @@ impl Substate {
             let mut delta = mem::take(parent);
             mem::swap(self, &mut delta);
 
-            self.selfdestruct_set.extend(delta.selfdestruct_set);
-            self.accessed_addresses.extend(delta.accessed_addresses);
+            union_into(&mut self.selfdestruct_set, delta.selfdestruct_set);
+            union_into(&mut self.accessed_addresses, delta.accessed_addresses);
             for (address, slot_set) in delta.accessed_storage_slots {
-                self.accessed_storage_slots
-                    .entry(address)
-                    .or_default()
-                    .extend(slot_set);
+                match self.accessed_storage_slots.entry(address) {
+                    Entry::Occupied(mut entry) => union_into(entry.get_mut(), slot_set),
+                    Entry::Vacant(entry) => {
+                        entry.insert(slot_set);
+                    }
+                }
             }
-            self.created_accounts.extend(delta.created_accounts);
+            union_into(&mut self.created_accounts, delta.created_accounts);
             self.refunded_gas = delta.refunded_gas;
-            self.transient_storage.extend(delta.transient_storage);
-            self.logs.extend(delta.logs);
+            // The child's values win, so only an empty parent may simply take them.
+            if self.transient_storage.is_empty() {
+                self.transient_storage = delta.transient_storage;
+            } else {
+                self.transient_storage.extend(delta.transient_storage);
+            }
+            if self.logs.is_empty() {
+                self.logs = delta.logs;
+            } else {
+                self.logs.extend(delta.logs);
+            }
         }
     }
 
