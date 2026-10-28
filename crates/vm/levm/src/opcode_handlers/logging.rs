@@ -3,8 +3,6 @@
 //! Includes the following opcodes:
 //!   - `LOG0` to `LOG4`
 
-use std::mem;
-
 use crate::{
     errors::{ExceptionalHalt, OpcodeResult, VMError},
     gas_cost,
@@ -13,7 +11,7 @@ use crate::{
     utils::size_offset_to_usize,
     vm::VM,
 };
-use ethrex_common::{H256, U256, types::Log};
+use ethrex_common::{H256, types::Log, utils::u256_to_be_bytes};
 
 /// Implementation for the `LOGn` opcodes.
 pub struct OpLogHandler<const N: usize>;
@@ -25,14 +23,11 @@ impl<const N: usize> OpcodeHandler for OpLogHandler<N> {
         }
 
         let [offset, len] = *vm.current_call_frame.stack.pop()?;
-        let topics = vm.current_call_frame.stack.pop::<N>()?.map(|topic| {
-            #[expect(unsafe_code)]
-            unsafe {
-                let mut hash = mem::transmute::<U256, H256>(topic);
-                hash.0.reverse();
-                hash
-            }
-        });
+        let topics = vm
+            .current_call_frame
+            .stack
+            .pop::<N>()?
+            .map(|topic| H256(u256_to_be_bytes(topic)));
         let (len, offset) = size_offset_to_usize(len, offset)?;
 
         vm.current_call_frame.increase_consumed_gas(gas_cost::log(
