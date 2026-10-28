@@ -131,6 +131,9 @@ fn field_decode_error<T>(field_name: &str, err: RLPDecodeError) -> RLPDecodeErro
     RLPDecodeError::Custom(err_msg)
 }
 
+/// Initial capacity of an [`Encoder`]'s payload buffer.
+const ENCODER_INITIAL_CAPACITY: usize = 256;
+
 /// # Struct encoding helper
 ///
 /// Used to encode a struct into RLP format.
@@ -184,11 +187,12 @@ impl core::fmt::Debug for Encoder<'_> {
 impl<'a> Encoder<'a> {
     /// Creates a new encoder that writes to the given buffer.
     pub fn new(buf: &'a mut dyn BufMut) -> Self {
-        // PERF: we could pre-allocate the buffer or switch to `ArrayVec`` if we could
-        // bound the size of the encoded data.
+        // The payload is gathered here before its length prefix is known. Starting
+        // with room for a typical struct (trie leaves, accounts, transactions) saves
+        // the reallocations an empty buffer goes through as the fields are added.
         Self {
             buf,
-            temp_buf: Default::default(),
+            temp_buf: Vec::with_capacity(ENCODER_INITIAL_CAPACITY),
         }
     }
 
