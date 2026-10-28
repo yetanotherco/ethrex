@@ -221,9 +221,10 @@ impl Substate {
     ///
     /// Does nothing if the substate has no backup.
     pub fn commit_backup(&mut self) {
-        if let Some(parent) = self.parent.as_mut() {
-            let mut delta = mem::take(parent);
-            mem::swap(self, &mut delta);
+        if let Some(parent) = self.parent.take() {
+            // Move the parent out of its box rather than `mem::take` it, which would allocate a
+            // default box only to drop it, and swap two whole substates.
+            let mut delta = mem::replace(self, *parent);
 
             // The child's warm entries stay; they are now the parent's to keep or revert.
             self.warm = mem::take(&mut delta.warm);
@@ -252,10 +253,10 @@ impl Substate {
     ///
     /// Does nothing if the substate has no backup.
     pub fn revert_backup(&mut self) {
-        if let Some(parent) = self.parent.as_mut() {
+        if let Some(parent) = self.parent.take() {
             let mut warm = mem::take(&mut self.warm);
             warm.undo_to(self.warm_checkpoint);
-            *self = mem::take(parent);
+            *self = *parent;
             self.warm = warm;
         }
     }
