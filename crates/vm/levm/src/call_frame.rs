@@ -566,23 +566,16 @@ impl<'a> VM<'a> {
         if self.call_frames.is_empty() {
             self.call_frames.reserve(8);
         }
-        self.call_frames.push(new_call_frame);
-        #[allow(unsafe_code, reason = "just pushed, so the vec is not empty")]
-        unsafe {
-            std::mem::swap(
-                &mut self.current_call_frame,
-                self.call_frames.last_mut().unwrap_unchecked(),
-            );
-        }
+        // Move, don't swap: a frame is several hundred bytes, and a swap compiles to a word loop
+        // that reads and writes both sides, where two moves are two plain copies.
+        let parent = std::mem::replace(&mut self.current_call_frame, new_call_frame);
+        self.call_frames.push(parent);
     }
 
     #[inline(always)]
     pub fn pop_call_frame(&mut self) -> Result<CallFrame, InternalError> {
-        let mut new = self.call_frames.pop().ok_or(InternalError::CallFrame)?;
-
-        std::mem::swap(&mut new, &mut self.current_call_frame);
-
-        Ok(new)
+        let parent = self.call_frames.pop().ok_or(InternalError::CallFrame)?;
+        Ok(std::mem::replace(&mut self.current_call_frame, parent))
     }
 
     pub fn is_initial_call_frame(&self) -> bool {
