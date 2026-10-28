@@ -25,11 +25,14 @@ use serde::{Deserialize, Serialize};
 /// Some data is prepared before the stateless validation, and some data is
 /// built on-demand during the stateless validation.
 /// This struct must be instantiated, filled, and consumed inside the zkVM.
+///
+/// The hash maps are only read and written by key; nothing iterates them, so their order can't
+/// reach a root or any other output. Keep it that way, or sort at the point of iteration.
 pub struct GuestProgramState {
     /// Map of code hashes to their corresponding bytecode.
     /// This is computed during guest program execution inside the zkVM,
     /// before the stateless validation.
-    pub codes_hashed: BTreeMap<H256, Code>,
+    pub codes_hashed: FxHashMap<H256, Code>,
     /// Map of block numbers to their corresponding block headers.
     /// The block headers are pushed to the zkVM RLP-encoded, and then
     /// decoded and stored in this map during guest program execution,
@@ -45,16 +48,16 @@ pub struct GuestProgramState {
     /// The chain configuration.
     pub chain_config: ChainConfig,
     /// Map of hashed addresses to their corresponding storage tries.
-    pub storage_tries: BTreeMap<H256, Trie>,
+    pub storage_tries: FxHashMap<H256, Trie>,
     /// Map of account addresses to their corresponding hashed addresses.
     /// This is a convenience map to avoid recomputing the hashed address
     /// multiple times during guest program execution.
     /// It is built on-demand during guest program execution, inside the zkVM.
-    pub account_hashes_by_address: BTreeMap<Address, H256>,
+    pub account_hashes_by_address: FxHashMap<Address, H256>,
     /// Map of hashed addresses to booleans, indicating whose account's storage tries were
     /// verified.
     /// Verification is done by hashing the trie and comparing the root hash with the account's storage root.
-    pub verified_storage_roots: BTreeMap<H256, bool>,
+    pub verified_storage_roots: FxHashMap<H256, bool>,
 }
 
 /// Witness data produced by the client and consumed by the guest program
@@ -568,7 +571,7 @@ impl GuestProgramState {
         };
         state_trie.hash_no_commit(crypto);
 
-        let mut storage_tries = BTreeMap::new();
+        let mut storage_tries = FxHashMap::default();
         for (hashed_address, storage_trie_root) in value.storage_trie_roots {
             // hash storage trie nodes
             let storage_trie = Trie::new_temp_with_root(storage_trie_root.into());
@@ -595,8 +598,8 @@ impl GuestProgramState {
             parent_block_header: parent_header,
             first_block_number: value.first_block_number,
             chain_config: value.chain_config,
-            account_hashes_by_address: BTreeMap::new(),
-            verified_storage_roots: BTreeMap::new(),
+            account_hashes_by_address: FxHashMap::default(),
+            verified_storage_roots: FxHashMap::default(),
         })
     }
 }
