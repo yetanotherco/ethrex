@@ -8,6 +8,14 @@ use rkyv::{Archive, Deserialize, Serialize};
 #[rkyv(remote = H256)]
 pub struct H256Wrapper([u8; 32]);
 
+impl ArchivedH256Wrapper {
+    /// The 32 bytes of the archived hash.
+    #[inline(always)]
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 impl From<H256Wrapper> for H256 {
     fn from(value: H256Wrapper) -> Self {
         Self(value.0)

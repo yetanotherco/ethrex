@@ -149,7 +149,10 @@ use ethrex_crypto::{Crypto, NativeCrypto};
 
 use crate::{NodeRLP, TrieDB, error::TrieError, nibbles::Nibbles};
 
-use super::{ValueRLP, node_hash::NodeHash};
+use super::{
+    ValueRLP,
+    node_hash::{ArchivedNodeHash, NodeHash},
+};
 
 /// A reference to a node.
 ///
@@ -487,6 +490,15 @@ impl Drop for BranchInitialization {
     }
 }
 
+/// The `NodeHash` an archived one holds: the same bytes, and infallible.
+#[inline(always)]
+fn node_hash_from_archived(hash: &ArchivedNodeHash) -> NodeHash {
+    match hash {
+        ArchivedNodeHash::Hashed(hash) => NodeHash::Hashed(ethereum_types::H256(*hash.as_bytes())),
+        ArchivedNodeHash::Inline(inline) => NodeHash::Inline((inline.0, inline.1)),
+    }
+}
+
 #[inline(never)]
 fn deserialize_branch_in_place<D>(
     branch: &branch::ArchivedBranchNode,
@@ -508,12 +520,19 @@ where
     // before assume_init transfers ownership to the returned Box.
     unsafe {
         let choices = core::ptr::addr_of_mut!((*ptr).choices).cast::<NodeRef>();
+        // A hash child (most of them: absent children and children outside the
+        // witness) cannot fail to decode, so it is written straight into its slot;
+        // only an embedded child goes through the fallible, pooled path.
         macro_rules! initialize_child {
             ($index:expr) => {{
-                choices.add($index).write(rkyv::Deserialize::deserialize(
-                    &branch.choices[$index],
-                    deserializer,
-                )?);
+                match &branch.choices[$index] {
+                    ArchivedNodeRef::Hash(hash) => choices
+                        .add($index)
+                        .write(NodeRef::Hash(node_hash_from_archived(hash))),
+                    ArchivedNodeRef::Node(node, _) => choices
+                        .add($index)
+                        .write(deserialize_shared_node_ref(node, deserializer)?),
+                }
                 guard.initialized_choices = $index + 1;
             }};
         }
@@ -746,4 +765,92 @@ impl Node {
 pub enum NodeRemoveResult {
     Mutated,
     New(Node),
+}
+
+#[cfg(test)]
+mod archived_decode_tests {
+    use super::*;
+    use ethrex_crypto::NativeCrypto;
+
+    /// xorshift64*: the same trees on every run.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn bytes(&mut self, len: usize) -> Vec<u8> {
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// A random node: branches with every kind of child (absent, an inline hash of
+    /// 1..=31 bytes, a 32-byte hash, an embedded node), extensions and leaves.
+    fn random_node(rng: &mut Rng, depth: u32) -> Node {
+        match (rng.next() % 4, depth) {
+            (0, _) | (_, 0) => {
+                let partial = Nibbles::from_hex(
+                    (0..rng.next() % 6)
+                        .map(|_| (rng.next() % 16) as u8)
+                        .collect(),
+                );
+                let len = 1 + (rng.next() % 40) as usize;
+                let value = rng.bytes(len);
+                LeafNode::new(partial, value).into()
+            }
+            (1, _) => {
+                let prefix = Nibbles::from_hex(
+                    (0..1 + rng.next() % 4)
+                        .map(|_| (rng.next() % 16) as u8)
+                        .collect(),
+                );
+                ExtensionNode::new(prefix, random_node(rng, depth - 1).into()).into()
+            }
+            _ => {
+                let mut choices = BranchNode::EMPTY_CHOICES;
+                for choice in choices.iter_mut() {
+                    *choice = match rng.next() % 5 {
+                        0 => NodeRef::Hash(NodeHash::Hashed(ethereum_types::H256::from_slice(
+                            &rng.bytes(32),
+                        ))),
+                        1 => {
+                            let len = 1 + (rng.next() % 31) as usize;
+                            NodeRef::Hash(NodeHash::from_slice(&rng.bytes(len)))
+                        }
+                        2 => random_node(rng, depth - 1).into(),
+                        _ => BranchNode::EMPTY_CHOICES[0].clone(),
+                    };
+                }
+                let value = if rng.next().is_multiple_of(3) {
+                    let len = (rng.next() % 20) as usize;
+                    rng.bytes(len)
+                } else {
+                    Vec::new()
+                };
+                BranchNode::new_with_value(choices, value).into()
+            }
+        }
+    }
+
+    /// Archiving a node and decoding it back (checked access, pooled shared nodes,
+    /// branches decoded in place) gives a node that archives to the same bytes and
+    /// hashes the same.
+    #[test]
+    fn decoded_nodes_match_the_archived_ones() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for round in 0..2_000 {
+            let node = random_node(&mut rng, 4);
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&node).expect("archive");
+            let decoded = rkyv::from_bytes::<Node, rkyv::rancor::Error>(&bytes).expect("decode");
+            let again = rkyv::to_bytes::<rkyv::rancor::Error>(&decoded).expect("archive again");
+            assert_eq!(bytes.as_slice(), again.as_slice(), "round {round}");
+            assert_eq!(
+                node.compute_hash(&NativeCrypto),
+                decoded.compute_hash(&NativeCrypto),
+                "round {round}"
+            );
+        }
+    }
 }
