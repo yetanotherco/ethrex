@@ -791,6 +791,28 @@ pub fn selfdestruct(
         .ok_or(OutOfGas.into())
 }
 
+/// Number of non-zero bytes in `data`, counted eight bytes at a time.
+///
+/// For each byte `b`, `((b & 0x7f) + 0x7f) | b` has its top bit set exactly when `b != 0`, and the
+/// addition never carries into the next byte. Targets without vector units (the zkVM guest)
+/// otherwise run a load, compare and add per byte.
+fn count_non_zero_bytes(data: &[u8]) -> usize {
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let (words, tail) = data.as_chunks::<8>();
+    let mut count: usize = 0;
+    for word in words {
+        let w = u64::from_le_bytes(*word);
+        let top = (((w & LOW7).wrapping_add(LOW7) | w) >> 7) & ONES;
+        // Each byte of `top` is 0 or 1, so the high byte of the product is their sum (at most 8).
+        #[expect(clippy::as_conversions, reason = "the sum is at most 8")]
+        let in_word = (top.wrapping_mul(ONES) >> 56) as usize;
+        count = count.wrapping_add(in_word);
+    }
+    let in_tail = tail.iter().filter(|&&byte| byte != 0).count();
+    count.wrapping_add(in_tail)
+}
+
 pub fn tx_calldata(calldata: &[u8]) -> Result<u64, VMError> {
     // This cost applies both for call and create
     // 4 gas for each zero byte in the transaction data, 16 gas for each non-zero byte.
@@ -799,8 +821,8 @@ pub fn tx_calldata(calldata: &[u8]) -> Result<u64, VMError> {
     // overflow → OutOfGas behavior), since:
     //   non_zero * 16 + zero * 4  ==  sum over bytes of (16 if non-zero else 4).
     let len = u64::try_from(calldata.len()).map_err(|_| InternalError::TypeConversion)?;
-    let non_zero_bytes = u64::try_from(calldata.iter().filter(|&&byte| byte != 0).count())
-        .map_err(|_| InternalError::TypeConversion)?;
+    let non_zero_bytes =
+        u64::try_from(count_non_zero_bytes(calldata)).map_err(|_| InternalError::TypeConversion)?;
     // non_zero_bytes <= len, so this never underflows.
     let zero_bytes = len.saturating_sub(non_zero_bytes);
 
@@ -1263,4 +1285,62 @@ pub fn bls12_pairing_check(k: usize) -> Result<u64, VMError> {
         .checked_add(BLS12_PAIRING_CHECK_FIXED_COST)
         .ok_or(InternalError::Overflow)?;
     Ok(gas_cost)
+}
+
+#[cfg(test)]
+#[allow(clippy::as_conversions, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    fn byte_loop(data: &[u8]) -> usize {
+        data.iter().filter(|&&byte| byte != 0).count()
+    }
+
+    #[test]
+    fn non_zero_count_matches_the_byte_loop() {
+        // Every byte value at every position of a word, next to zero and 0xff neighbours.
+        for len in 0..40usize {
+            for value in 0..=255u8 {
+                for position in 0..len {
+                    for fill in [0u8, 0x80, 0xff] {
+                        let mut data = vec![fill; len];
+                        data[position] = value;
+                        assert_eq!(
+                            count_non_zero_bytes(&data),
+                            byte_loop(&data),
+                            "{len} {value} {position} {fill}"
+                        );
+                    }
+                }
+            }
+        }
+        // Pseudo-random data with a mix of zero runs, across lengths and start offsets.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                if x.is_multiple_of(3) {
+                    0
+                } else {
+                    (x >> 24) as u8
+                }
+            })
+            .collect();
+        for start in 0..9 {
+            for end in (start..data.len()).step_by(97) {
+                let slice = &data[start..end];
+                assert_eq!(count_non_zero_bytes(slice), byte_loop(slice));
+            }
+        }
+    }
+
+    #[test]
+    fn tx_calldata_prices_zero_and_non_zero_bytes() {
+        let data = [0u8, 1, 0, 0, 0xff, 0, 0, 0, 7, 0, 0x80];
+        // 4 non-zero bytes at 16 gas, 7 zero bytes at 4 gas.
+        assert_eq!(tx_calldata(&data).ok(), Some(4 * 16 + 7 * 4));
+        assert_eq!(tx_calldata(&[]).ok(), Some(0));
+    }
 }
