@@ -272,7 +272,15 @@ pub fn precompiles_for_fork(fork: Fork) -> impl Iterator<Item = Precompile> {
         .filter(move |precompile| precompile.active_since_fork <= fork)
 }
 
+/// Number of leading zero bytes shared by every precompile address (all are at most 0x0101).
+const PRECOMPILE_ZERO_PREFIX: usize = 18;
+
 pub fn is_precompile(address: &Address, fork: Fork, vm_type: VMType) -> bool {
+    // Every precompile address (including P256VERIFY and EXECUTE) starts with 18 zero bytes, so any
+    // other address is rejected without walking the precompile table.
+    if address.0[..PRECOMPILE_ZERO_PREFIX] != [0u8; PRECOMPILE_ZERO_PREFIX] {
+        return false;
+    }
     if fork >= Fork::LStar && matches!(vm_type, VMType::L1) && *address == EXECUTE.address {
         return true;
     }
@@ -1535,5 +1543,57 @@ mod tests {
         ));
         // LStar on L1: is a precompile.
         assert!(is_precompile(&execute_addr, Fork::LStar, VMType::L1));
+    }
+
+    /// `is_precompile`'s early reject is only sound if every precompile address has the zero prefix.
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn every_precompile_address_has_the_zero_prefix() {
+        let zero = [0u8; PRECOMPILE_ZERO_PREFIX];
+        for precompile in PRECOMPILES.iter().chain([&P256VERIFY, &EXECUTE]) {
+            assert_eq!(
+                precompile.address.0[..PRECOMPILE_ZERO_PREFIX],
+                zero,
+                "{}",
+                precompile.name
+            );
+        }
+    }
+
+    /// The early reject agrees with the table walk on addresses on both sides of the prefix.
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn is_precompile_matches_the_table_walk() {
+        let forks = [
+            Fork::Frontier,
+            Fork::Cancun,
+            Fork::Prague,
+            Fork::Osaka,
+            Fork::LStar,
+        ];
+        let vm_types = [VMType::L1, VMType::L2(Default::default())];
+        let mut addresses = Vec::new();
+        for low in 0..=0x1ffu16 {
+            let mut address = Address::zero();
+            address.0[18..].copy_from_slice(&low.to_be_bytes());
+            addresses.push(address);
+            for byte in [0usize, 10, 17] {
+                let mut far = address;
+                far.0[byte] = 1;
+                addresses.push(far);
+            }
+        }
+        for fork in forks {
+            for vm_type in &vm_types {
+                for address in &addresses {
+                    let walk = (fork >= Fork::LStar
+                        && matches!(vm_type, VMType::L1)
+                        && *address == EXECUTE.address)
+                        || (matches!(vm_type, VMType::L2(_)) && *address == P256VERIFY.address)
+                        || precompiles_for_fork(fork).any(|p| p.address == *address);
+                    assert_eq!(is_precompile(address, fork, *vm_type), walk, "{address:?}");
+                }
+            }
+        }
     }
 }
