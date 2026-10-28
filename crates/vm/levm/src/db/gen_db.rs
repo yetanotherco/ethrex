@@ -347,11 +347,15 @@ impl GeneralizedDatabase {
             tracker.insert(address);
         }
 
-        if self.current_accounts_state.contains_key(&address) {
-            return self
-                .current_accounts_state
-                .get_mut(&address)
-                .ok_or(InternalError::AccountNotFound);
+        // One probe on a hit. The borrow checker can't yet see that the early return ends the
+        // map borrow before the code below uses `self` again (NLL problem case 3), hence the
+        // pointer round trip.
+        if let Some(account) = self.current_accounts_state.get_mut(&address) {
+            let account: *mut LevmAccount = account;
+            // SAFETY: `account` points into `current_accounts_state`, borrowed mutably through
+            // `self` for the returned lifetime; nothing else touches the map before the return.
+            #[expect(unsafe_code, reason = "NLL problem case 3: a conditional early return")]
+            return Ok(unsafe { &mut *account });
         }
 
         // Initial-state fast path.
