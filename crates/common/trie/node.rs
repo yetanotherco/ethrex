@@ -201,10 +201,13 @@ where
     D: rkyv::rancor::Fallible + Pooling + ?Sized,
     D::Error: Source,
 {
-    Ok(NodeRef::Node(
-        rkyv::Deserialize::deserialize(node, deserializer)?,
-        OnceLock::new(),
-    ))
+    // Each embedded node is decoded on its own, without the deserializer's pool of
+    // shared pointers: a witness trie references every node once, and a node that
+    // an archive did share would decode to equal, immutable copies (the trie clones
+    // a shared node before changing it anyway). That saves a hash-table probe and
+    // insert per node.
+    let node: Node = rkyv::Deserialize::deserialize(node.get(), deserializer)?;
+    Ok(NodeRef::Node(Arc::new(node), OnceLock::new()))
 }
 
 impl NodeRef {
@@ -834,9 +837,8 @@ mod archived_decode_tests {
         }
     }
 
-    /// Archiving a node and decoding it back (checked access, pooled shared nodes,
-    /// branches decoded in place) gives a node that archives to the same bytes and
-    /// hashes the same.
+    /// Archiving a node and decoding it back (checked access, branches decoded in
+    /// place) gives a node that archives to the same bytes and hashes the same.
     #[test]
     fn decoded_nodes_match_the_archived_ones() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -849,6 +851,35 @@ mod archived_decode_tests {
             assert_eq!(
                 node.compute_hash(&NativeCrypto),
                 decoded.compute_hash(&NativeCrypto),
+                "round {round}"
+            );
+        }
+    }
+
+    /// A node the archive shares between two parents decodes to two equal copies:
+    /// the decoded trie hashes the same and both children hold the same node.
+    #[test]
+    fn a_shared_node_decodes_to_equal_copies() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        for round in 0..200 {
+            let shared: Arc<Node> = Arc::new(random_node(&mut rng, 3));
+            let mut choices = BranchNode::EMPTY_CHOICES;
+            choices[3] = NodeRef::Node(shared.clone(), OnceLock::new());
+            choices[11] = NodeRef::Node(shared, OnceLock::new());
+            let node: Node = BranchNode::new(choices).into();
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&node).expect("archive");
+            let decoded = rkyv::from_bytes::<Node, rkyv::rancor::Error>(&bytes).expect("decode");
+            assert_eq!(
+                node.compute_hash(&NativeCrypto),
+                decoded.compute_hash(&NativeCrypto),
+                "round {round}"
+            );
+            let Node::Branch(branch) = &decoded else {
+                panic!("round {round}: not a branch");
+            };
+            assert_eq!(
+                branch.choices[3].compute_hash(&NativeCrypto),
+                branch.choices[11].compute_hash(&NativeCrypto),
                 "round {round}"
             );
         }
