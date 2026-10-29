@@ -401,7 +401,10 @@ pub fn compute_receipts_root_and_logs_bloom(
     let iter = indices_in_key_order(receipts.len()).map(|idx| {
         let receipt = &receipts[idx];
         let bloom = crate::types::bloom_from_logs(&receipt.logs, crypto);
-        logs_bloom |= bloom;
+        // A receipt without logs has the zero bloom, which ORs to nothing.
+        if !receipt.logs.is_empty() {
+            or_bloom(&mut logs_bloom, &bloom);
+        }
         (
             idx.encode_to_vec(),
             receipt.encode_inner_with_precomputed_bloom(bloom),
@@ -409,6 +412,18 @@ pub fn compute_receipts_root_and_logs_bloom(
     });
     let receipts_root = Trie::compute_hash_from_sorted_iter(iter, crypto);
     (receipts_root, logs_bloom)
+}
+
+/// `acc |= other`, eight bytes at a time. `Bloom`'s own `|=` is a byte loop, seven
+/// instructions a byte on a 64-bit RISC-V guest.
+fn or_bloom(acc: &mut Bloom, other: &Bloom) {
+    for (a, b) in acc.0.chunks_exact_mut(8).zip(other.0.chunks_exact(8)) {
+        let mut x = [0u8; 8];
+        x.copy_from_slice(a);
+        let mut y = [0u8; 8];
+        y.copy_from_slice(b);
+        a.copy_from_slice(&(u64::from_ne_bytes(x) | u64::from_ne_bytes(y)).to_ne_bytes());
+    }
 }
 
 // See [EIP-4895](https://eips.ethereum.org/EIPS/eip-4895)
@@ -959,6 +974,76 @@ pub fn calc_excess_blob_gas(parent: &BlockHeader, schedule: ForkBlobSchedule, fo
 #[cfg(test)]
 mod test {
 
+    /// The word-wise OR equals `Bloom`'s `|=`, on dense and sparse blooms.
+    #[test]
+    fn or_bloom_matches_bloom_or() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let mut acc = Bloom::zero();
+        let mut want = Bloom::zero();
+        for round in 0..200 {
+            let mut other = Bloom::zero();
+            for i in 0..256 {
+                let r = next();
+                if round % 2 == 0 || r % 31 == 0 {
+                    other.0[i] = (r >> 8) as u8;
+                }
+            }
+            or_bloom(&mut acc, &other);
+            want |= other;
+            assert_eq!(acc, want, "round {round}");
+            if round % 50 == 49 {
+                acc = Bloom::zero();
+                want = Bloom::zero();
+            }
+        }
+    }
+
+    /// The receipts root and the header bloom from the single pass equal the receipts
+    /// root alone and the OR of every receipt's bloom, with receipts that have logs and
+    /// receipts that have none.
+    #[test]
+    fn receipts_root_and_logs_bloom_match_separate_computation() {
+        let crypto = &NativeCrypto;
+        let log = |a: u8, topics: usize| Log {
+            address: Address::repeat_byte(a),
+            topics: (0..topics)
+                .map(|t| H256::repeat_byte(a ^ t as u8))
+                .collect(),
+            data: Bytes::from(vec![a; a as usize % 7]),
+        };
+        let receipts: Vec<Receipt> = (0..40u8)
+            .map(|i| {
+                let logs = match i % 4 {
+                    0 => vec![],
+                    1 => vec![log(i, 0)],
+                    2 => vec![log(i, 1), log(i.wrapping_mul(7), 3)],
+                    _ => vec![log(i, 4)],
+                };
+                Receipt::new(
+                    TxType::EIP1559,
+                    i % 5 != 0,
+                    21_000 * (u64::from(i) + 1),
+                    logs,
+                )
+            })
+            .collect();
+        for n in [0, 1, 4, 17, 40] {
+            let mut want_bloom = Bloom::zero();
+            for receipt in &receipts[..n] {
+                want_bloom |= crate::types::bloom_from_logs(&receipt.logs, crypto);
+            }
+            let (root, bloom) = compute_receipts_root_and_logs_bloom(&receipts[..n], crypto);
+            assert_eq!(root, compute_receipts_root(&receipts[..n], crypto), "{n}");
+            assert_eq!(bloom, want_bloom, "{n}");
+        }
+    }
+
     #[test]
     fn indices_in_key_order_list_every_index_once_in_rlp_byte_order() {
         for len in (0..=600usize).chain([65535, 65536, 65537, 70000]) {
@@ -972,7 +1057,7 @@ mod test {
 
     use super::*;
     use crate::constants::EMPTY_KECCAK_HASH;
-    use crate::types::{BLOB_BASE_FEE_UPDATE_FRACTION, ELASTICITY_MULTIPLIER};
+    use crate::types::{BLOB_BASE_FEE_UPDATE_FRACTION, ELASTICITY_MULTIPLIER, Log, TxType};
     use ethereum_types::H160;
     use hex_literal::hex;
     use std::str::FromStr;
