@@ -210,6 +210,12 @@ where
 
     let last_block_hash = last_block.header.compute_block_hash(crypto.as_ref());
 
+    // A zkVM guest halts right after this returns, so dropping the witness state
+    // would only walk every trie node, map and code to free memory nobody reuses.
+    // Leak it on that target; everywhere else it is dropped as usual.
+    #[cfg(target_arch = "riscv64")]
+    core::mem::forget(wrapped_db);
+
     Ok(BatchExecutionResult {
         receipts: acc_receipts,
         initial_state_hash,
