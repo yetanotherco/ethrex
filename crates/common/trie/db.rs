@@ -57,6 +57,13 @@ pub trait TrieDB: Send + Sync {
     fn flatkeyvalue_computed_ref(&self, key: &Nibbles) -> bool {
         self.flatkeyvalue_computed(key.clone())
     }
+
+    /// `false` only for a backend whose `flatkeyvalue_computed*` is `false` for every
+    /// key, always. A trie over such a backend never reads the paths it marks dirty,
+    /// so it skips recording them.
+    fn may_have_flatkeyvalue(&self) -> bool {
+        true
+    }
 }
 
 // TODO: we should replace this with BackendTrieDB
@@ -142,6 +149,11 @@ impl InMemoryTrieDB {
 impl TrieDB for InMemoryTrieDB {
     fn flatkeyvalue_computed_ref(&self, _key: &Nibbles) -> bool {
         // This backend has no flat-key-value storage, so no owned key is needed.
+        false
+    }
+
+    fn may_have_flatkeyvalue(&self) -> bool {
+        // No flat-key-value storage: `flatkeyvalue_computed*` is always false.
         false
     }
 

@@ -142,7 +142,10 @@ impl Trie {
     pub fn get(&self, pathrlp: &[u8]) -> Result<Option<ValueRLP>, TrieError> {
         let path = Nibbles::from_bytes(pathrlp);
 
-        if !self.dirty.contains(&path) && self.db().flatkeyvalue_computed_ref(&path) {
+        if self.db().may_have_flatkeyvalue()
+            && !self.dirty.contains(&path)
+            && self.db().flatkeyvalue_computed_ref(&path)
+        {
             let Some(value_rlp) = self.db.get(path)? else {
                 return Ok(None);
             };
@@ -170,8 +173,15 @@ impl Trie {
     /// Insert an RLP-encoded value into the trie.
     pub fn insert(&mut self, path: PathRLP, value: ValueRLP) -> Result<(), TrieError> {
         let path = Nibbles::from_bytes(&path);
-        self.pending_removal.remove(&path);
-        self.dirty.insert(path.clone());
+        // Both sets are bookkeeping for `commit` and for flat-key-value reads: skip the
+        // removal's hash probe when nothing is pending, and the dirty mark when the
+        // backend has no flat-key-value data for `get` to consult it against.
+        if !self.pending_removal.is_empty() {
+            self.pending_removal.remove(&path);
+        }
+        if self.db.may_have_flatkeyvalue() {
+            self.dirty.insert(path.clone());
+        }
 
         if self.root.is_valid() {
             // If the trie is not empty, call the root node's insertion logic.
@@ -193,7 +203,9 @@ impl Trie {
     /// Remove a value from the trie given its RLP-encoded path.
     /// Returns the value if it was succesfully removed or None if it wasn't part of the trie
     pub fn remove(&mut self, path: &[u8]) -> Result<Option<ValueRLP>, TrieError> {
-        self.dirty.insert(Nibbles::from_bytes(path));
+        if self.db.may_have_flatkeyvalue() {
+            self.dirty.insert(Nibbles::from_bytes(path));
+        }
         if !self.root.is_valid() {
             return Ok(None);
         }
@@ -849,5 +861,92 @@ mod tests {
     #[test]
     fn empty_trie_hash_matches_keccak() {
         assert_eq!(EMPTY_TRIE_HASH, H256(keccak_hash([RLP_NULL])));
+    }
+
+    /// An in-memory backend that keeps the default `may_have_flatkeyvalue` (true), so a
+    /// trie over it records dirty paths, while answering every lookup exactly as
+    /// `InMemoryTrieDB` does.
+    struct TrackedInMemory(InMemoryTrieDB);
+
+    impl TrieDB for TrackedInMemory {
+        fn get(&self, key: Nibbles) -> Result<Option<Vec<u8>>, TrieError> {
+            self.0.get(key)
+        }
+
+        fn put_batch(&self, key_values: Vec<(Nibbles, Vec<u8>)>) -> Result<(), TrieError> {
+            self.0.put_batch(key_values)
+        }
+    }
+
+    /// A trie over a backend without flat-key-value data skips the dirty set, and the
+    /// pending-removal probe when nothing is pending. Its reads, roots and commits
+    /// equal those of the same trie with both sets kept, through inserts, removals and
+    /// re-inserts of removed paths.
+    #[test]
+    fn untracked_in_memory_trie_matches_tracked() {
+        let mut fast = Trie::new_temp();
+        let mut slow = Trie::new(Box::new(TrackedInMemory(InMemoryTrieDB::new_empty())));
+        assert!(!fast.db().may_have_flatkeyvalue());
+        assert!(slow.db().may_have_flatkeyvalue());
+
+        // xorshift64*, seeded.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let key = |k: u64| -> Vec<u8> {
+            let mut out = vec![0u8; 32];
+            out[..8].copy_from_slice(&k.to_be_bytes());
+            out[24..].copy_from_slice(&k.to_le_bytes());
+            out
+        };
+
+        // The paths removed and not inserted again since the last commit: what the
+        // pending-removal set must hold in both tries.
+        let mut pending = FxHashSet::default();
+        for round in 0..3000u64 {
+            let k = key(next() % 64);
+            match next() % 4 {
+                0 | 1 => {
+                    let value = next().to_be_bytes()[..(round % 8 + 1) as usize].to_vec();
+                    fast.insert(k.clone(), value.clone()).unwrap();
+                    slow.insert(k.clone(), value).unwrap();
+                    pending.remove(&Nibbles::from_bytes(&k));
+                }
+                2 => {
+                    if fast.root.is_valid() {
+                        pending.insert(Nibbles::from_bytes(&k));
+                    }
+                    assert_eq!(fast.remove(&k).unwrap(), slow.remove(&k).unwrap());
+                }
+                _ => {}
+            }
+            assert_eq!(fast.pending_removal, pending);
+            assert_eq!(slow.pending_removal, pending);
+            assert_eq!(fast.get(&k).unwrap(), slow.get(&k).unwrap());
+            if round % 50 == 0 {
+                assert_eq!(
+                    fast.hash_no_commit(&ethrex_crypto::NativeCrypto),
+                    slow.hash_no_commit(&ethrex_crypto::NativeCrypto)
+                );
+            }
+            if round % 500 == 499 {
+                let mut a = fast.commit_without_storing(&ethrex_crypto::NativeCrypto);
+                let mut b = slow.commit_without_storing(&ethrex_crypto::NativeCrypto);
+                a.sort();
+                b.sort();
+                assert_eq!(a, b);
+                pending.clear();
+            }
+        }
+        assert!(fast.dirty.is_empty());
+        assert!(!slow.dirty.is_empty());
+        assert_eq!(
+            fast.hash_no_commit(&ethrex_crypto::NativeCrypto),
+            slow.hash_no_commit(&ethrex_crypto::NativeCrypto)
+        );
     }
 }
