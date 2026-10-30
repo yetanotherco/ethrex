@@ -728,6 +728,10 @@ pub struct VM<'a> {
     /// A shared `&'static` reference to a per-fork table that is `const`-built once for the
     /// whole process (immutable), so each VM holds only a pointer instead of a 2 KB inline copy.
     pub(crate) opcode_table: &'static [OpCodeFn; 256],
+    /// The error of the opcode handler that just returned `Halt`, if it failed. It lives
+    /// here rather than in the dispatch loop so a handler takes only the VM: one argument
+    /// fewer to set up for every opcode dispatched.
+    pub(crate) dispatch_error: OnceCell<VMError>,
     /// Crypto provider for cryptographic operations.
     pub crypto: &'a dyn Crypto,
     /// Optional stateless validator for the EXECUTE precompile.
@@ -1121,6 +1125,7 @@ impl<'a> VM<'a> {
             env,
             frame_tx_context: None,
             opcode_table: VM::build_opcode_table(fork),
+            dispatch_error: OnceCell::new(),
             crypto,
             stateless_validator,
         };
@@ -2810,7 +2815,9 @@ impl<'a> VM<'a> {
     fn run_dispatch<const TRACED: bool, const VALIDATING: bool>(
         &mut self,
     ) -> Result<ContextResult, VMError> {
-        let mut error = OnceCell::<VMError>::new();
+        // A handler that failed leaves its error in `dispatch_error`; nothing is pending
+        // when the loop starts.
+        self.dispatch_error = OnceCell::new();
 
         #[cfg(feature = "perf_opcode_timings")]
         let mut timings = crate::timings::OPCODE_TIMINGS.lock().expect("poison");
@@ -2843,7 +2850,7 @@ impl<'a> VM<'a> {
             let opcode_time_start = std::time::Instant::now();
 
             #[allow(clippy::indexing_slicing, clippy::as_conversions)]
-            let op_result = opcode_table[opcode as usize].call(self, &mut error);
+            let op_result = opcode_table[opcode as usize].call(self);
 
             #[cfg(feature = "perf_opcode_timings")]
             {
@@ -2853,12 +2860,12 @@ impl<'a> VM<'a> {
 
             // Struct-log post-step (compiled out entirely when !TRACED).
             if TRACED {
-                self.trace_post_step(gas_before_op, &error);
+                self.trace_post_step(gas_before_op);
             }
 
             let result = match op_result {
                 OpcodeResult::Continue => continue,
-                OpcodeResult::Halt => match error.take() {
+                OpcodeResult::Halt => match self.dispatch_error.take() {
                     None => self.handle_opcode_result()?,
                     Some(error) => self.handle_opcode_error(error)?,
                 },
@@ -3132,7 +3139,7 @@ impl<'a> VM<'a> {
     /// buffered entry. Cold + non-inlined for the same reason as `trace_pre_step`.
     #[cold]
     #[inline(never)]
-    fn trace_post_step(&mut self, gas_before_op: u64, error: &OnceCell<VMError>) {
+    fn trace_post_step(&mut self, gas_before_op: u64) {
         #[expect(
             clippy::as_conversions,
             reason = "gas_remaining is i64; clamp to 0 before converting to u64"
@@ -3149,7 +3156,7 @@ impl<'a> VM<'a> {
         // (pre-London) SELFDESTRUCT, the refund counter shown is the value
         // *after* the opcode's accounting applied.
         let refund_after = self.substate.refunded_gas;
-        let err_str = error.get().map(|e| e.to_string());
+        let err_str = self.dispatch_error.get().map(|e| e.to_string());
         self.opcode_tracer
             .finalize_step(gas_cost, refund_after, err_str.as_deref());
     }
@@ -3498,6 +3505,7 @@ impl<'a> VM<'a> {
             prep_region_backup_marker: PrepareRegionBackupMarker::default(),
             pending_prep_oog: false,
             opcode_table: VM::build_opcode_table(fork),
+            dispatch_error: OnceCell::new(),
             crypto,
             stateless_validator: None,
             validation_observer: ValidationObserver::disabled(),

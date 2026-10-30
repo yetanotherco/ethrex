@@ -1,5 +1,5 @@
 use crate::{
-    errors::{OpcodeResult, VMError},
+    errors::OpcodeResult,
     opcode_handlers::{
         OpInvalidHandler, OpStopHandler, OpcodeHandler, arithmetic::*, bitwise_comparison::*,
         block::*, dup::*, environment::*, exchange::*, frame_tx::*, keccak::*, logging::*, push::*,
@@ -8,7 +8,6 @@ use crate::{
     vm::VM,
 };
 use ethrex_common::types::Fork;
-use std::cell::OnceCell;
 use strum::EnumString;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, EnumString, Hash)]
@@ -386,7 +385,7 @@ impl From<Opcode> for usize {
 
 /// Represents an opcode function handler.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct OpCodeFn(fn(&mut VM<'_>, &mut OnceCell<VMError>) -> OpcodeResult);
+pub(crate) struct OpCodeFn(fn(&mut VM<'_>) -> OpcodeResult);
 
 impl OpCodeFn {
     pub const fn new<T>() -> Self
@@ -398,16 +397,16 @@ impl OpCodeFn {
 
     /// Call the opcode handler.
     #[inline(always)]
-    pub fn call(self, vm: &mut VM<'_>, error: &mut OnceCell<VMError>) -> OpcodeResult {
-        (self.0)(vm, error)
+    pub fn call(self, vm: &mut VM<'_>) -> OpcodeResult {
+        (self.0)(vm)
     }
 
-    fn wrap<T>(vm: &mut VM<'_>, error: &mut OnceCell<VMError>) -> OpcodeResult
+    fn wrap<T>(vm: &mut VM<'_>) -> OpcodeResult
     where
         T: OpcodeHandler,
     {
         T::eval(vm).unwrap_or_else(|err| {
-            _ = error.set(err);
+            _ = vm.dispatch_error.set(err);
             OpcodeResult::Halt
         })
     }
