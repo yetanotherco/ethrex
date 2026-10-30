@@ -36,7 +36,7 @@ impl OpcodeHandler for OpDupNHandler {
             .current_call_frame
             .bytecode
             .dispatch_buf()
-            .get(vm.current_call_frame.pc)
+            .get(vm.current_call_frame.pc())
             .copied()
             .unwrap_or_default();
 
@@ -72,7 +72,7 @@ impl OpcodeHandler for OpDupNHandler {
                 .get_unchecked(absolute_offset)
         })?;
 
-        vm.current_call_frame.pc = vm.current_call_frame.pc.wrapping_add(1);
+        vm.current_call_frame.advance_by(1);
         Ok(OpcodeResult::Continue)
     }
 }

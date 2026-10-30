@@ -315,8 +315,13 @@ pub struct CallFrame {
     ///
     /// Additionally, gas limit won't be a problem since https://eips.ethereum.org/EIPS/eip-7825 limits it to 2^24, which is lower than i64::MAX.
     pub gas_remaining: i64,
-    /// Program Counter
-    pub pc: usize,
+    /// The next opcode's address: `bytecode.dispatch_buf()`'s start plus the program
+    /// counter (see [`CallFrame::pc`]). The dispatch loop reads and steps this one
+    /// pointer instead of adding the buffer's start to a counter for every opcode. It
+    /// points into the heap buffer `bytecode` owns, which neither moving the frame nor
+    /// anything else moves while the frame holds it; only `set_code` replaces it, and
+    /// it re-derives this pointer.
+    ip: *const u8,
     /// Address of the account that sent the message
     pub msg_sender: Address,
     /// Address of the recipient of the message
@@ -482,7 +487,7 @@ impl CallFrame {
         // Note: Do not use ..Default::default() because it has runtime cost.
 
         #[expect(clippy::as_conversions, reason = "remaining gas conversion")]
-        Self {
+        let mut frame = Self {
             gas_limit,
             gas_remaining: gas_limit as i64,
             msg_sender,
@@ -501,29 +506,55 @@ impl CallFrame {
             memory,
             call_frame_backup: CallFrameBackup::default(),
             output: Bytes::default(),
-            pc: 0,
+            ip: core::ptr::null(),
             sub_return_data: Bytes::default(),
             state_gas_used_at_entry: 0,
             frame_state_gas_spilled: 0,
             target_alive: false,
             new_account_state_gas_charged: false,
-        }
+        };
+        frame.ip = frame.bytecode.dispatch_buf().as_ptr();
+        frame
     }
 
     #[inline(always)]
     pub fn next_opcode(&self) -> u8 {
-        // SAFETY: pc reaches at most bytecode_len + 32 (a PUSH32 at the last real
-        // byte advances 33 total: +1 in the dispatch loop, +32 in the handler).
-        // dispatch_buf() is bytecode_len + BYTECODE_PADDING (33) long, so the read
-        // is always in bounds.
+        // SAFETY: `ip` is `dispatch_buf()`'s start plus pc, and pc reaches at most
+        // bytecode_len + 32 (a PUSH32 at the last real byte advances 33 total: +1 in
+        // the dispatch loop, +32 in the handler). dispatch_buf() is bytecode_len +
+        // BYTECODE_PADDING (33) long, so the read is always in bounds, and the buffer
+        // is the one `bytecode` owns (see the field).
         #[expect(unsafe_code, reason = "pc bounded by padded bytecode len")]
         unsafe {
-            *self.bytecode.dispatch_buf().get_unchecked(self.pc)
+            *self.ip
         }
     }
 
+    /// The program counter: the next opcode's offset in the bytecode.
+    #[inline(always)]
     pub fn pc(&self) -> usize {
-        self.pc
+        self.ip
+            .addr()
+            .wrapping_sub(self.bytecode.dispatch_buf().as_ptr().addr())
+    }
+
+    /// Moves the program counter to `pc`.
+    #[inline(always)]
+    pub fn set_pc(&mut self, pc: usize) {
+        self.ip = self.bytecode.dispatch_buf().as_ptr().wrapping_add(pc);
+    }
+
+    /// The address of the next opcode (`dispatch_buf()`'s start plus pc), for the
+    /// handlers that read their immediate bytes in place.
+    #[inline(always)]
+    pub(crate) fn ip(&self) -> *const u8 {
+        self.ip
+    }
+
+    /// Moves the program counter forward by `n` bytes.
+    #[inline(always)]
+    pub(crate) fn advance_by(&mut self, n: usize) {
+        self.ip = self.ip.wrapping_add(n);
     }
 
     /// Increases gas consumption of CallFrame and Environment, returning an error if the callframe gas limit is reached.
@@ -551,7 +582,9 @@ impl CallFrame {
     }
 
     pub fn set_code(&mut self, code: Code) -> Result<(), VMError> {
+        let pc = self.pc();
         self.bytecode = code;
+        self.set_pc(pc);
         Ok(())
     }
 }
@@ -644,12 +677,8 @@ impl<'a> VM<'a> {
     }
 
     #[inline(always)]
-    #[expect(
-        clippy::arithmetic_side_effects,
-        reason = "pc bounded by padded bytecode len"
-    )]
     pub fn advance_pc(&mut self) {
-        self.current_call_frame.pc += 1;
+        self.current_call_frame.advance_by(1);
     }
 }
 
@@ -657,6 +686,71 @@ impl<'a> VM<'a> {
 mod tests {
     use super::*;
     use ethrex_common::types::AccountInfo;
+
+    fn frame_with_code(code: &[u8]) -> CallFrame {
+        CallFrame::new(
+            Address::zero(),
+            Address::zero(),
+            Address::zero(),
+            Code::from_bytecode_unchecked(Bytes::copy_from_slice(code), H256::zero()),
+            U256::zero(),
+            Bytes::new(),
+            false,
+            1_000_000,
+            0,
+            false,
+            false,
+            0,
+            0,
+            Stack::default(),
+            Memory::default(),
+        )
+    }
+
+    /// The program counter kept as a pointer into the bytecode: it starts at 0, steps
+    /// and jumps as a counter would, reads the byte at its offset, survives the frame
+    /// being moved (into a box and a vector, and back), and keeps its offset when
+    /// `set_code` swaps the bytecode.
+    #[test]
+    fn program_counter_as_a_pointer() {
+        let code: Vec<u8> = (0u8..=200).collect();
+        let mut frame = frame_with_code(&code);
+        assert_eq!(frame.pc(), 0);
+        assert_eq!(frame.next_opcode(), 0);
+        for (step, byte) in code.iter().enumerate().skip(1).take(150) {
+            frame.advance_by(1);
+            assert_eq!(frame.pc(), step);
+            assert_eq!(frame.next_opcode(), *byte);
+        }
+        frame.set_pc(7);
+        assert_eq!((frame.pc(), frame.next_opcode()), (7, 7));
+        frame.advance_by(32);
+        assert_eq!((frame.pc(), frame.next_opcode()), (39, 39));
+
+        let boxed = Box::new(frame);
+        let mut frames = vec![*boxed];
+        let mut frame = frames.pop().unwrap();
+        assert_eq!((frame.pc(), frame.next_opcode()), (39, 39));
+
+        // Past the real code the padding reads as STOP (zero).
+        frame.set_pc(code.len());
+        assert_eq!(frame.next_opcode(), 0);
+        frame.set_pc(code.len() + 32);
+        assert_eq!(frame.next_opcode(), 0);
+
+        let other: Vec<u8> = (0u8..=200).rev().collect();
+        frame.set_pc(5);
+        frame
+            .set_code(Code::from_bytecode_unchecked(
+                Bytes::copy_from_slice(&other),
+                H256::zero(),
+            ))
+            .unwrap();
+        assert_eq!(
+            (frame.pc(), Some(frame.next_opcode())),
+            (5, other.get(5).copied())
+        );
+    }
 
     #[test]
     fn absorb_keeps_earliest_original_value() {

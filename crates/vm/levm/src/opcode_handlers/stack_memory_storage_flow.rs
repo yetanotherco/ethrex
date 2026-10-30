@@ -69,7 +69,7 @@ impl OpcodeHandler for OpPcHandler {
         //   offset will never cause an underflow condition.
         vm.current_call_frame
             .stack
-            .push(vm.current_call_frame.pc.wrapping_sub(1).into())?;
+            .push(vm.current_call_frame.pc().wrapping_sub(1).into())?;
 
         Ok(OpcodeResult::Continue)
     }
@@ -490,7 +490,7 @@ fn jump(vm: &mut VM<'_>, target: usize, parent_gas_cost: u64) -> Result<(), VMEr
             return jump_traced(vm, target, parent_gas_cost);
         }
         // Hot path: fuse JUMP/JUMPI + JUMPDEST without any trace bookkeeping.
-        vm.current_call_frame.pc = target.wrapping_add(1);
+        vm.current_call_frame.set_pc(target.wrapping_add(1));
         vm.current_call_frame
             .increase_consumed_gas(gas_cost::JUMPDEST)?;
         Ok(())
@@ -514,7 +514,7 @@ fn jump_traced(vm: &mut VM<'_>, target: usize, parent_gas_cost: u64) -> Result<(
     let synth = build_jumpdest_step(vm, target);
 
     // Fuse: charge JUMPDEST + advance PC past it.
-    vm.current_call_frame.pc = target.wrapping_add(1);
+    vm.current_call_frame.set_pc(target.wrapping_add(1));
     vm.current_call_frame
         .increase_consumed_gas(gas_cost::JUMPDEST)?;
 

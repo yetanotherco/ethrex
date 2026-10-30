@@ -5,7 +5,7 @@
 //!   - `PUSH1` to `PUSH32`
 
 use crate::{
-    errors::{InternalError, OpcodeResult, VMError},
+    errors::{OpcodeResult, VMError},
     gas_cost,
     opcode_handlers::OpcodeHandler,
     vm::VM,
@@ -38,33 +38,21 @@ impl<const N: usize> OpcodeHandler for OpPushHandler<N> {
         // Keep the unchecked read below sound if the padding ever shrinks.
         const { assert!(BYTECODE_PADDING > 32) };
 
-        let literal_offset = vm.current_call_frame.pc;
-        // Use a *checked* add for the pc advance, not unchecked `+= N`. Both
-        // compute the same value (pc never overflows in practice), but the
-        // checked form is required for good codegen here: with unchecked/wrapping
-        // arithmetic LLVM can no longer prove the immediate slice length is the
-        // constant `N`, so the `get_unchecked` read below degrades to a
-        // runtime-length memcpy and the PUSH hot loop runs ~2x slower (IPC
-        // collapses 3.4 -> 1.2). The overflow branch is free (perfectly
-        // predicted) and never taken.
-        vm.current_call_frame.pc = literal_offset
-            .checked_add(N)
-            .ok_or(InternalError::Overflow)?;
-        // `pc` is now exactly `literal_offset + N`; reuse it as the immediate end.
-        let literal_end = vm.current_call_frame.pc;
+        // The immediate bytes start at the next opcode's address.
+        let literal = vm.current_call_frame.ip();
+        vm.current_call_frame.advance_by(N);
 
         vm.current_call_frame
             .increase_consumed_gas(gas_cost::PUSHN)?;
 
-        let bytecode = vm.current_call_frame.bytecode.dispatch_buf();
-        // SAFETY: PUSH only dispatches on a real opcode byte, so
-        // `literal_offset <= bytecode_len`; the buffer is padded with
+        // SAFETY: PUSH only dispatches on a real opcode byte, so `literal` is at most
+        // `dispatch_buf()`'s start plus bytecode_len; the buffer is padded with
         // BYTECODE_PADDING (>= N) trailing zeros, so N bytes are always in bounds.
         // Immediate bytes past the real code end read as zero, matching EVM
         // PUSH-past-end semantics (the padding is zeroed).
         let mut buf = [0u8; N];
         #[expect(unsafe_code, reason = "read bounded by padded bytecode len")]
-        buf.copy_from_slice(unsafe { bytecode.get_unchecked(literal_offset..literal_end) });
+        buf.copy_from_slice(unsafe { core::slice::from_raw_parts(literal, N) });
         let value = u256_from_big_endian_const(buf);
         vm.current_call_frame.stack.push(value)?;
 

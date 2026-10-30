@@ -2828,7 +2828,7 @@ impl<'a> VM<'a> {
 
         loop {
             // Capture pc BEFORE advance_pc() — this is the address of the current opcode.
-            let pc_of_current_op = self.current_call_frame.pc;
+            let pc_of_current_op = self.current_call_frame.pc();
             let opcode = self.current_call_frame.next_opcode();
             self.advance_pc();
 
